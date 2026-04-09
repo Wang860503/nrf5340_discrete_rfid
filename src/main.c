@@ -11,7 +11,8 @@
 
 LOG_MODULE_REGISTER(rfid_main);
 
-#define PWM_PERIOD_NS 8000  // 125kHz
+#define PWM_PERIOD 128  // 125kHz
+#define RFID_50_PERCENT_DUTY 64
 #define TICK_BUFFER_SIZE 400
 #define ADC_HYSTERESIS 60  // 數位遲滯 LSB
 #define EM_SHORT_MIN 180   // us
@@ -20,10 +21,13 @@ LOG_MODULE_REGISTER(rfid_main);
 #define EM_LONG_MAX 650    // us
 
 static const struct device* adc_dev = DEVICE_DT_GET(DT_NODELABEL(adc));
+static const struct adc_dt_spec adc_chan_0 =
+    ADC_DT_SPEC_GET_BY_IDX(DT_PATH(zephyr_user), 0);
+static const struct adc_dt_spec adc_chan_1 =
+    ADC_DT_SPEC_GET_BY_IDX(DT_PATH(zephyr_user), 1);
 static const struct device* pwm_dev = DEVICE_DT_GET(DT_NODELABEL(pwm0));
 
 static uint32_t tick_buffer[TICK_BUFFER_SIZE];
-static uint16_t demod_counter = 0;
 static uint8_t data_valid[64];
 static uint64_t em_card_code = 0;
 
@@ -114,12 +118,17 @@ void decode_bitstream(uint16_t total_ticks, uint8_t* out_bits, int* out_len) {
 int em4095_adc_receiver(void) {
   uint8_t raw_bits[350];
   int raw_bit_count = 0;
-  demod_counter = 0;
+  int demod_counter = 0;
 
   /* start 125KHZ */
-  pwm_set_cycles(pwm_dev, 0, PWM_PERIOD_NS, PWM_PERIOD_NS / 2, 0);
-  pwm_set_cycles(pwm_dev, 1, PWM_PERIOD_NS, PWM_PERIOD_NS / 2,
+  pwm_set_cycles(pwm_dev, 0, PWM_PERIOD, RFID_50_PERCENT_DUTY, 0);
+  pwm_set_cycles(pwm_dev, 1, PWM_PERIOD, RFID_50_PERCENT_DUTY,
                  PWM_POLARITY_INVERTED);
+
+  k_sleep(K_MSEC(10));
+
+  adc_read(adc_dev, &sequence);
+  LOG_DBG("ADC Test - CH0: %d, CH1: %d\n", adc_raw[0], adc_raw[1]);
 
   /*start sampling*/
   bool last_state = false;
@@ -129,7 +138,7 @@ int em4095_adc_receiver(void) {
   uint64_t stop_time = k_uptime_get() + 120;
   while (k_uptime_get() < stop_time) {
     if (adc_read(adc_dev, &sequence) == 0) {
-      bool current_state = (adc_raw[0] > (adc_raw[1] + ADC_HYSTERESIS));
+      bool current_state = (adc_raw[1] > (adc_raw[0] + ADC_HYSTERESIS));
 
       if (current_state != last_state) {
         uint32_t now = k_cycle_get_32();
@@ -146,8 +155,10 @@ int em4095_adc_receiver(void) {
   }
 
   /*stop sampling*/
-  pwm_set_cycles(pwm_dev, 0, PWM_PERIOD_NS, 0, 0);
-  pwm_set_cycles(pwm_dev, 1, PWM_PERIOD_NS, 0, 0);
+  pwm_set_cycles(pwm_dev, 0, PWM_PERIOD, 0, 0);
+  pwm_set_cycles(pwm_dev, 1, PWM_PERIOD, 0, 0);
+
+  LOG_INF("Sampling done. Captured ticks: %d", demod_counter);
 
   /*decode*/
   decode_bitstream(demod_counter, raw_bits, &raw_bit_count);
@@ -176,12 +187,24 @@ int em4095_adc_receiver(void) {
 }
 
 int main(void) {
+  int err;
   LOG_INF("nRF5340 Discrete RFID Starting...");
+  err = adc_channel_setup_dt(&adc_chan_0);
+  if (err < 0) {
+    LOG_ERR("Could not setup channel (%d)\n", err);
+    return err;
+  }
+  err = adc_channel_setup_dt(&adc_chan_1);
+  if (err < 0) {
+    LOG_ERR("Could not setup channel (%d)\n", err);
+    return err;
+  }
+
   while (1) {
     if (!em4095_adc_receiver()) {
-      LOG_DBG("No card detected.");
+      LOG_INF("No card detected.");
     }
-    k_sleep(K_MSEC(500));
+    k_sleep(K_MSEC(1000));
   }
 
   return 0;

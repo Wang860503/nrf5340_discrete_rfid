@@ -10,6 +10,7 @@
         group1{
             psels = <NRF_PSEL(PWM_OUT0, 0, 25)>,
                     <NRF_PSEL(PWM_OUT1, 0, 26)>;
+            nordic,drive-mode = <NRF_DRIVE_H0H1>;
         };
     };
 
@@ -43,5 +44,11 @@
         zephyr,acquisition-time = <ADC_ACQ_TIME_DEFAULT>;
         zephyr,input-positive = <NRF_SAADC_AIN1>;
         zephyr,resolution = <12>;
+    };
+};
+
+/ {
+    zephyr,user {
+        io-channels = <&adc 0>, <&adc 1>;
     };
 };
