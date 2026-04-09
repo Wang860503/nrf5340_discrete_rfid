@@ -1,23 +1,28 @@
-&pwm0 {
+/* nRF54L15 RFID Device Tree 配置 */
+
+&pwm20 {
     status = "okay";
-    pinctrl-0 = <&pwm0_default>;
-    pinctrl-1 = <&pwm0_sleep>;
+    pinctrl-0 = <&pwm20_default>;
+    pinctrl-1 = <&pwm20_sleep>;
     pinctrl-names = "default", "sleep";
 };
 
 &pinctrl {
-    pwm0_default: pwm0_default{
-        group1{
-            psels = <NRF_PSEL(PWM_OUT0, 0, 25)>,
-                    <NRF_PSEL(PWM_OUT1, 0, 26)>;
+    /* 注意：nRF54L15 的引腳定義為 <port pin>，例如 (1, 10) 代表 P1.10 */
+    pwm20_default: pwm20_default {
+        group1 {
+            /* 建議使用 P1.10 與 P1.11，這兩支腳通常支援 High Drive */
+            psels = <NRF_PSEL(PWM_OUT0, 1, 10)>,
+                    <NRF_PSEL(PWM_OUT1, 1, 11)>;
+            /* nRF54 系列依然支援 H0H1 高驅動模式 */
             nordic,drive-mode = <NRF_DRIVE_H0H1>;
         };
     };
 
-    pwm0_sleep: pwm0_sleep {
+    pwm20_sleep: pwm20_sleep {
         group1 {
-            psels = <NRF_PSEL(PWM_OUT0, 0, 25)>,
-                    <NRF_PSEL(PWM_OUT1, 0, 26)>;
+            psels = <NRF_PSEL(PWM_OUT0, 1, 10)>,
+                    <NRF_PSEL(PWM_OUT1, 1, 11)>;
             low-power-enable;
         };
     };
@@ -28,12 +33,14 @@
     #address-cells = <1>;
     #size-cells = <0>;
 
+    /* nRF54L15 的 ADC 頻道設定與 5340 類似，但輸入定義更嚴謹 */
     channel@0 {
         reg = <0>;
         zephyr,gain = "ADC_GAIN_1_4";
-        zephyr,reference = "ADC_REF_INTERNAL";
+        zephyr,reference = "ADC_REF_INTERNAL"; // 54L15 內部參考通常為 0.6V
         zephyr,acquisition-time = <ADC_ACQ_TIME_DEFAULT>;
-        zephyr,input-positive = <NRF_SAADC_AIN0>;
+        /* AIN0 通常對應 P0.04 */
+        zephyr,input-positive = <NRF_SAADC_AIN0>; 
         zephyr,resolution = <12>;
     };
 
@@ -42,6 +49,7 @@
         zephyr,gain = "ADC_GAIN_1_4";
         zephyr,reference = "ADC_REF_INTERNAL";
         zephyr,acquisition-time = <ADC_ACQ_TIME_DEFAULT>;
+        /* AIN1 通常對應 P0.05 */
         zephyr,input-positive = <NRF_SAADC_AIN1>;
         zephyr,resolution = <12>;
     };
@@ -49,6 +57,9 @@
 
 / {
     zephyr,user {
+        /* 更新為指向新的 pwm20 與 adc 實例 */
         io-channels = <&adc 0>, <&adc 1>;
+        pwms = <&pwm20 0 PWM_HZ(125000) PWM_POLARITY_NORMAL>,
+               <&pwm20 1 PWM_HZ(125000) PWM_POLARITY_INVERTED>;
     };
 };
