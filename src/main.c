@@ -14,7 +14,7 @@ LOG_MODULE_REGISTER(rfid_main);
 #define PWM_PERIOD 128  // 125kHz
 #define RFID_50_PERCENT_DUTY 64
 #define TICK_BUFFER_SIZE 400
-#define ADC_HYSTERESIS 60  // 數位遲滯 LSB
+#define ADC_HYSTERESIS 25  // 數位遲滯 LSB
 #define EM_SHORT_MIN 180   // us
 #define EM_SHORT_MAX 350   // us
 #define EM_LONG_MIN 400    // us
