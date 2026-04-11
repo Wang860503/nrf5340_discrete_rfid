@@ -1,3 +1,11 @@
+/*
+ * DK 上 Arduino A0/A1 = P0.04/P0.05 = SAADC 與內建 COMP 的 AIN0/AIN1 同源。
+ * 若同時啟用 &adc，常見現象是 COMP 讀值不變、raw_edges 永遠 0。
+ */
+&adc {
+    status = "disabled";
+};
+
 &pwm0 {
     status = "okay";
     pinctrl-0 = <&pwm0_default>;
@@ -23,32 +31,20 @@
     };
 };
 
-&adc {
+&comp {
     status = "okay";
-    #address-cells = <1>;
-    #size-cells = <0>;
-
-    channel@0 {
-        reg = <0>;
-        zephyr,gain = "ADC_GAIN_1_6";
-        zephyr,reference = "ADC_REF_INTERNAL";
-        zephyr,acquisition-time = <ADC_ACQ_TIME_DEFAULT>;
-        zephyr,input-positive = <NRF_SAADC_AIN0>;
-        zephyr,resolution = <12>;
-    };
-
-    channel@1 {
-        reg = <1>;
-        zephyr,gain = "ADC_GAIN_1_6";
-        zephyr,reference = "ADC_REF_INTERNAL";
-        zephyr,acquisition-time = <ADC_ACQ_TIME_DEFAULT>;
-        zephyr,input-positive = <NRF_SAADC_AIN1>;
-        zephyr,resolution = <12>;
-    };
-};
-
-/ {
-    zephyr,user {
-        io-channels = <&adc 0>, <&adc 1>;
-    };
+    /*
+     * 差動輸入（對應廠商「兩腳位比較器」概念）：
+     *   psel = AIN0 → 通常對 P0.04，作正端
+     *   extrefsel = AIN1 → 通常對 P0.05，作負端
+     * 綁定 nordic,nrf-comp 只接受 main-mode "SE"|"DIFF"（不可用 "differential"）、
+     * sp-mode（非 speed-mode）、enable-hyst（非 hysteresis 字串）、isource 須大寫 "DISABLED"。
+     */
+    main-mode = "DIFF";
+    /* 與註解一致：P0.04 / P0.05。若實際走線是 P0.06 / P0.07 請改 AIN2 / AIN3 */
+    psel = "AIN2";
+    extrefsel = "AIN3";
+    sp-mode = "HIGH";
+    enable-hyst;
+    isource = "DISABLED";
 };
