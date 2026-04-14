@@ -7,25 +7,27 @@
 };
 
 &pwm0 {
-    status = "okay";
+    /* 載波改由 main.c 的 TIMER+DPPI+GPIOTE 驅動，避免與 P1.09/P1.10 衝突 */
+    status = "disabled";
     pinctrl-0 = <&pwm0_default>;
     pinctrl-1 = <&pwm0_sleep>;
     pinctrl-names = "default", "sleep";
 };
 
 &pinctrl {
-    pwm0_default: pwm0_default{
-        group1{
-            psels = <NRF_PSEL(PWM_OUT0, 0, 25)>,
-                    <NRF_PSEL(PWM_OUT1, 0, 26)>;
+    pwm0_default: pwm0_default {
+        group1 {
+            /* 修改點：從 Port 0 改為 Port 1 */
+            psels = <NRF_PSEL(PWM_OUT0, 1, 9)>,   /* P1.09 */
+                    <NRF_PSEL(PWM_OUT1, 1, 10)>;  /* P1.10 */
             nordic,drive-mode = <NRF_DRIVE_H0H1>;
         };
     };
 
     pwm0_sleep: pwm0_sleep {
         group1 {
-            psels = <NRF_PSEL(PWM_OUT0, 0, 25)>,
-                    <NRF_PSEL(PWM_OUT1, 0, 26)>;
+            psels = <NRF_PSEL(PWM_OUT0, 1, 9)>,   /* P1.09 */
+                    <NRF_PSEL(PWM_OUT1, 1, 10)>;  /* P1.10 */
             low-power-enable;
         };
     };
@@ -33,18 +35,12 @@
 
 &comp {
     status = "okay";
-    /*
-     * 差動輸入（對應廠商「兩腳位比較器」概念）：
-     *   psel = AIN0 → 通常對 P0.04，作正端
-     *   extrefsel = AIN1 → 通常對 P0.05，作負端
-     * 綁定 nordic,nrf-comp 只接受 main-mode "SE"|"DIFF"（不可用 "differential"）、
-     * sp-mode（非 speed-mode）、enable-hyst（非 hysteresis 字串）、isource 須大寫 "DISABLED"。
-     */
-    main-mode = "DIFF";
-    /* 與註解一致：P0.04 / P0.05。若實際走線是 P0.06 / P0.07 請改 AIN2 / AIN3 */
-    psel = "AIN2";
-    extrefsel = "AIN3";
-    sp-mode = "HIGH";
-    enable-hyst;
-    isource = "DISABLED";
+    main-mode = "SE";       /* 單端模式：比較 psel 與內部參考 */
+    psel = "AIN2";          /* 對應 P0.06，接 RFID 訊號 */
+    refsel = "VDD";         /* 內部分壓參考（VDD ladder） */
+    th-down = <23>;         /* 約 33/64 * VDD */
+    th-up = <25>;           /* 約 35/64 * VDD */
+    sp-mode = "HIGH";       /* 高速模式 */
+    enable-hyst;            /* 保留遲滯 */
+    isource = "DISABLED";   /* 關閉內部電流源 */
 };

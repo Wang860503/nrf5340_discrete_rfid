@@ -1,483 +1,510 @@
 /*
- * 最終修訂版：優化抗噪門檻，解決 176 bits 無法對齊 Header 的問題
+ * 針對外部電源 Duty 55 調優版：
+ * 1. 暴力過濾 125kHz 載波殘留雜訊
+ * 2. 修正曼徹斯特判定區間以匹配實測之 305~397us 脈衝
  */
 
+#include <errno.h>
+#include <hal/nrf_gpiote.h>
+#include <hal/nrf_timer.h>
+#include <nrfx_dppi.h>
+#include <nrfx_gpiote.h>
+#include <nrfx_timer.h>
 #include <string.h>
 #include <zephyr/device.h>
+#include <zephyr/devicetree.h>
 #include <zephyr/drivers/comparator.h>
-#include <zephyr/drivers/pwm.h>
+#include <zephyr/drivers/comparator/nrf_comp.h>
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
 
+#if DT_NODE_EXISTS(DT_NODELABEL(comp)) && \
+    DT_NODE_HAS_STATUS(DT_NODELABEL(comp), okay)
+BUILD_ASSERT(
+    DT_PROP(DT_NODELABEL(comp), enable_hyst) != 0,
+    "app.overlay: &comp 請保留 enable-hyst（nRF5340 差動模式即晶片最大遲滯）");
+#endif
+
 LOG_MODULE_REGISTER(rfid_main);
 
+/* 載波：計時器在 PWM_PERIOD tick CLEAR → 125kHz；A 延後開啟騰出 B→A 死區 */
 #define PWM_PERIOD 128
-/*
- * PWM pulse width (cycles out of PWM_PERIOD). Vendor example often uses
- * ~60/128. Higher duty drives the coil harder (more current on CLK_P/CLK_N
- * half-bridge). On a marginal supply (e.g. 3.0 V, thin USB cable, small bulk
- * caps), that extra current drops VDD and the SoC brown-out resets — "reboot
- * loop" when set to 60. Keep 40 for bring-up; move toward 60 only after:
- * solid 3.3 V rail, adequate current rating, short/heavy GND return, and
- * bulk/decoupling at MCU and analog front-end.
- */
-#define RFID_50_PERCENT_DUTY 35
-/* Logs showed stored==1000 (saturated); later edges dropped → misaligned frame
- */
+#define RFID_DEAD_TICKS 44
+#define RFID_CH_A_ON_LEAD 26U /* 約 1.25µs @ 16MHz；與 2*dead 幾何搭配 */
+#define RFID_GPIOTE_PIN_A 41  /* P1.09 */
+#define RFID_GPIOTE_PIN_B 42  /* P1.10 */
 #define TICK_BUFFER_SIZE 2048
-/* Manchester output cap; logs often hit 512 while ticks still saturate */
 #define EM_DECODED_BITS_CAP 1024
 
-/*
- * Ignore edge-to-edge gaps <= this (us). Too low (e.g. 55) admits 125kHz
- * ripple: huge raw_edges/stored but decoded bits never show EM4100's 9 leading
- * 1s (see max run log).
- */
-#define EM_EDGE_MIN_US 60
+/* --- BSP 核心調優區 --- */
 
-/* Try decode when at least this many intervals are stored (was hard-coded >64;
- * logs peaked ~60). */
+/* 兩次「採納邊緣」至少間隔如此，否則視為載波漣波（125kHz 週期約 8us） */
+#define EM_EDGE_MIN_US 500
+
+/* 125kHz/64 曼徹斯特：半位元約 256us、全位元約 512us（留邊界給 LC 與卡片誤差）
+ */
+#define EM_SHORT_MIN 500
+#define EM_SHORT_MAX 750
+#define EM_LONG_MIN 800
+#define EM_LONG_MAX 1300
+
+/* 保持偵測穩定性的參數 */
 #define EM_MIN_STORED_TO_DECODE 50
-
 #define RFID_CAPTURE_WINDOW_MS 600
-
-/*
- * First interval after arm often spans idle+settle (tens of ms) and must not
- * enter the buffer.
- */
 #define EM_SKIP_FIRST_GAP_US 2500
-
-/*
- * Manchester-ish buckets (us). Non-overlapping SHORT then LONG.
- * Fingerprint had gaps >2000us (e.g. 4–7ms): those used to hit else and reset
- * state every time, yielding max run ones/zeros ~2–4 (quasi-alternating
- * garbage).
- */
-#define EM_SHORT_MIN 70
-#define EM_SHORT_MAX 400
-#define EM_LONG_MIN 410
-#define EM_LONG_MAX 2200
-
-/* Gaps above LONG but below this: ignore (no emit, no state reset) — envelope
- * dropout */
 #define EM_MANCHESTER_GAP_HOLD_US 10000
-/* Very long idle: resync decoder */
 #define EM_MANCHESTER_RESYNC_US 15000
 
-#define RFID_COMP_SAMPLE_INTERVAL_US 0
-#define RFID_ENABLE_CARRIER_PWM 1
-
 static const struct device* comp_dev = DEVICE_DT_GET(DT_NODELABEL(comp));
-#if RFID_ENABLE_CARRIER_PWM
-static const struct device* pwm_dev = DEVICE_DT_GET(DT_NODELABEL(pwm0));
-#endif
+static const nrfx_timer_t rfid_timer = NRFX_TIMER_INSTANCE(2);
+static const nrfx_gpiote_t rfid_gpiote = NRFX_GPIOTE_INSTANCE(0);
+static const nrfx_dppi_t rfid_dppi = NRFX_DPPI_INSTANCE(0);
 
 static uint32_t tick_buffer[TICK_BUFFER_SIZE];
 static uint8_t dec_raw_bits[EM_DECODED_BITS_CAP];
-static uint8_t dec_saved_bits[EM_DECODED_BITS_CAP];
-static uint8_t dec_work_bits[EM_DECODED_BITS_CAP];
+
+static bool nrfx_ok_or_already(nrfx_err_t err) {
+  return (err == NRFX_SUCCESS) || (err == NRFX_ERROR_INVALID_STATE) ||
+         (err == NRFX_ERROR_ALREADY);
+}
+
+static int start_carrier_with_dppi_deadtime(void) {
+  uint32_t ch_a_on;
+  uint32_t ch_a_off;
+  uint32_t ch_b_on;
+  uint32_t ch_b_off;
+  uint32_t active_ticks_a;
+  uint32_t active_ticks_b;
+  uint8_t te_ch_a;
+  uint8_t te_ch_b;
+  uint8_t dppi_ch_a_on;
+  uint8_t dppi_ch_a_off;
+  uint8_t dppi_ch_b_on;
+  uint8_t dppi_ch_b_off;
+  nrfx_err_t err;
+
+  LOG_INF("dppi: setup enter dead=%u period=%u lead_A=%u", RFID_DEAD_TICKS,
+          PWM_PERIOD, RFID_CH_A_ON_LEAD);
+
+  /* 125kHz / 對稱死區幾何：總導通 = PWM - 2*dead，A 延後 RFID_CH_A_ON_LEAD 再開
+   */
+  {
+    uint32_t total_active = PWM_PERIOD - (RFID_DEAD_TICKS * 2U);
+    if (total_active < 4U) {
+      LOG_ERR("dead too long for period (2*dead=%u period=%u)",
+              2U * RFID_DEAD_TICKS, PWM_PERIOD);
+      return -EINVAL;
+    }
+    active_ticks_a = total_active / 2U;
+    active_ticks_b = total_active - active_ticks_a;
+    ch_a_on = RFID_CH_A_ON_LEAD;
+    ch_a_off = ch_a_on + active_ticks_a;
+    ch_b_on = ch_a_off + RFID_DEAD_TICKS;
+    ch_b_off = ch_b_on + active_ticks_b;
+    if (ch_b_off > PWM_PERIOD) {
+      LOG_ERR("ch_b_off %u > PWM_PERIOD %u (增大 lead 或減 dead)", ch_b_off,
+              PWM_PERIOD);
+      return -EINVAL;
+    }
+  }
+
+  /* Zephyr gpio_nrfx 會先 init GPIOTE0，此處再呼叫會得到
+   * NRFX_ERROR_ALREADY（須視為成功） */
+  err = nrfx_gpiote_init(&rfid_gpiote, NRFX_GPIOTE_DEFAULT_CONFIG_IRQ_PRIORITY);
+  if (!nrfx_ok_or_already(err)) {
+    LOG_ERR("gpiote_init failed: %d", err);
+    return -EIO;
+  }
+
+  err = nrfx_gpiote_channel_alloc(&rfid_gpiote, &te_ch_a);
+  if (err != NRFX_SUCCESS) {
+    LOG_ERR("gpiote ch alloc A: %d", err);
+    return -ENOMEM;
+  }
+  err = nrfx_gpiote_channel_alloc(&rfid_gpiote, &te_ch_b);
+  if (err != NRFX_SUCCESS) {
+    LOG_ERR("gpiote ch alloc B: %d", err);
+    return -ENOMEM;
+  }
+
+  nrfx_gpiote_output_config_t out_cfg = {
+      .drive = NRF_GPIO_PIN_H0H1,
+      .input_connect = NRF_GPIO_PIN_INPUT_DISCONNECT,
+      .pull = NRF_GPIO_PIN_NOPULL,
+  };
+  /* Task 模式 + LoToHi：由 DPPI 改訂閱 SET/CLR（非 OUT
+   * toggle），避免漏脈衝造成相位反轉 */
+  nrfx_gpiote_task_config_t task_a = {
+      .task_ch = te_ch_a,
+      .polarity = NRF_GPIOTE_POLARITY_LOTOHI,
+      .init_val = NRF_GPIOTE_INITIAL_VALUE_LOW,
+  };
+  nrfx_gpiote_task_config_t task_b = {
+      .task_ch = te_ch_b,
+      .polarity = NRF_GPIOTE_POLARITY_LOTOHI,
+      .init_val = NRF_GPIOTE_INITIAL_VALUE_LOW,
+  };
+
+  err = nrfx_gpiote_output_configure(&rfid_gpiote, RFID_GPIOTE_PIN_A, &out_cfg,
+                                     &task_a);
+  if (err != NRFX_SUCCESS) {
+    LOG_ERR("gpiote out cfg A pin=%u: %d", (unsigned)RFID_GPIOTE_PIN_A, err);
+    return -EIO;
+  }
+  err = nrfx_gpiote_output_configure(&rfid_gpiote, RFID_GPIOTE_PIN_B, &out_cfg,
+                                     &task_b);
+  if (err != NRFX_SUCCESS) {
+    LOG_ERR("gpiote out cfg B pin=%u: %d", (unsigned)RFID_GPIOTE_PIN_B, err);
+    return -EIO;
+  }
+
+  nrfx_gpiote_out_clear(&rfid_gpiote, RFID_GPIOTE_PIN_A);
+  nrfx_gpiote_out_clear(&rfid_gpiote, RFID_GPIOTE_PIN_B);
+
+  /* 以 channel index 啟用 Task（避免 nrfx 依 pin 查表時與 Zephyr
+   * 內部狀態不一致） */
+  nrf_gpiote_task_enable(rfid_gpiote.p_reg, te_ch_a);
+  nrf_gpiote_task_enable(rfid_gpiote.p_reg, te_ch_b);
+  LOG_INF("dppi: gpiote TE ch=%u,%u enabled", te_ch_a, te_ch_b);
+
+  if (ch_b_off < PWM_PERIOD && rfid_timer.cc_channel_count < 5U) {
+    LOG_ERR("TIMER2 needs >=5 CC (B_CLR@ch_b_off=%u, CLEAR@%u)", ch_b_off,
+            PWM_PERIOD);
+    return -ENOTSUP;
+  }
+
+  /* NRFX_TIMER_DEFAULT_CONFIG 要的是 Hz，勿用
+   * nrf_timer_frequency_t（NRF_TIMER_FREQ_16MHz==0 會除零） */
+  nrfx_timer_config_t timer_cfg = NRFX_TIMER_DEFAULT_CONFIG(16000000U);
+  err = nrfx_timer_init(&rfid_timer, &timer_cfg, NULL);
+  if (!nrfx_ok_or_already(err)) {
+    LOG_ERR("timer_init failed: %d", err);
+    return -EIO;
+  }
+
+  nrfx_timer_clear(&rfid_timer);
+  nrfx_timer_extended_compare(&rfid_timer, NRF_TIMER_CC_CHANNEL0, ch_a_on, 0,
+                              false);
+  nrfx_timer_extended_compare(&rfid_timer, NRF_TIMER_CC_CHANNEL1, ch_a_off, 0,
+                              false);
+  nrfx_timer_extended_compare(&rfid_timer, NRF_TIMER_CC_CHANNEL2, ch_b_on, 0,
+                              false);
+  /* B 關在 ch_b_off；週期務必在 PWM_PERIOD 才 CLEAR（ch_b_off<128 時須 CC4） */
+  if (ch_b_off < PWM_PERIOD) {
+    nrfx_timer_extended_compare(&rfid_timer, NRF_TIMER_CC_CHANNEL3, ch_b_off, 0,
+                                false);
+    nrfx_timer_extended_compare(&rfid_timer, NRF_TIMER_CC_CHANNEL4, PWM_PERIOD,
+                                NRF_TIMER_SHORT_COMPARE4_CLEAR_MASK, false);
+  } else {
+    nrfx_timer_extended_compare(&rfid_timer, NRF_TIMER_CC_CHANNEL3, ch_b_off,
+                                NRF_TIMER_SHORT_COMPARE3_CLEAR_MASK, false);
+  }
+
+  err = nrfx_dppi_channel_alloc(&rfid_dppi, &dppi_ch_a_on);
+  if (err != NRFX_SUCCESS) {
+    LOG_ERR("dppi alloc a_on: %d", err);
+    return -ENOMEM;
+  }
+  err = nrfx_dppi_channel_alloc(&rfid_dppi, &dppi_ch_a_off);
+  if (err != NRFX_SUCCESS) {
+    LOG_ERR("dppi alloc a_off: %d", err);
+    return -ENOMEM;
+  }
+  err = nrfx_dppi_channel_alloc(&rfid_dppi, &dppi_ch_b_on);
+  if (err != NRFX_SUCCESS) {
+    LOG_ERR("dppi alloc b_on: %d", err);
+    return -ENOMEM;
+  }
+  err = nrfx_dppi_channel_alloc(&rfid_dppi, &dppi_ch_b_off);
+  if (err != NRFX_SUCCESS) {
+    LOG_ERR("dppi alloc b_off: %d", err);
+    return -ENOMEM;
+  }
+
+  nrf_timer_publish_set(rfid_timer.p_reg, NRF_TIMER_EVENT_COMPARE0,
+                        dppi_ch_a_on);
+  nrf_gpiote_subscribe_set(rfid_gpiote.p_reg, nrf_gpiote_set_task_get(te_ch_a),
+                           dppi_ch_a_on);
+
+  nrf_timer_publish_set(rfid_timer.p_reg, NRF_TIMER_EVENT_COMPARE1,
+                        dppi_ch_a_off);
+  nrf_gpiote_subscribe_set(rfid_gpiote.p_reg, nrf_gpiote_clr_task_get(te_ch_a),
+                           dppi_ch_a_off);
+
+  nrf_timer_publish_set(rfid_timer.p_reg, NRF_TIMER_EVENT_COMPARE2,
+                        dppi_ch_b_on);
+  nrf_gpiote_subscribe_set(rfid_gpiote.p_reg, nrf_gpiote_set_task_get(te_ch_b),
+                           dppi_ch_b_on);
+
+  /* B_CLR 僅綁 CC3@ch_b_off；CC4@PWM_PERIOD 只做 TIMER CLEAR，不發 DPPI */
+  nrf_timer_publish_set(rfid_timer.p_reg, NRF_TIMER_EVENT_COMPARE3,
+                        dppi_ch_b_off);
+  nrf_gpiote_subscribe_set(rfid_gpiote.p_reg, nrf_gpiote_clr_task_get(te_ch_b),
+                           dppi_ch_b_off);
+
+  (void)nrfx_dppi_channel_enable(&rfid_dppi, dppi_ch_a_on);
+  (void)nrfx_dppi_channel_enable(&rfid_dppi, dppi_ch_a_off);
+  (void)nrfx_dppi_channel_enable(&rfid_dppi, dppi_ch_b_on);
+  (void)nrfx_dppi_channel_enable(&rfid_dppi, dppi_ch_b_off);
+
+  nrfx_timer_enable(&rfid_timer);
+
+  LOG_INF("DPPI carrier: pwm=%u dead=%u active=%u+%u b_off=%u tail=%u%s",
+          PWM_PERIOD, RFID_DEAD_TICKS, active_ticks_a, active_ticks_b, ch_b_off,
+          PWM_PERIOD - ch_b_off,
+          (ch_b_off < PWM_PERIOD) ? " CC4=CLEAR" : " CC3=CLEAR");
+  LOG_INF("Timing ticks: A[%u,%u] B[%u,%u] te=%u,%u dppi=%u,%u,%u,%u", ch_a_on,
+          ch_a_off, ch_b_on, ch_b_off, te_ch_a, te_ch_b, dppi_ch_a_on,
+          dppi_ch_a_off, dppi_ch_b_on, dppi_ch_b_off);
+  return 0;
+}
 
 void invert_bits(uint8_t* bits, int len) {
-    for (int i = 0; i < len; i++) {
-        bits[i] = !bits[i];
-    }
+  for (int i = 0; i < len; i++) {
+    bits[i] = !bits[i];
+  }
 }
 
-/* 智慧搜尋：在位元流中尋找 EM4100 的 9 個連續 '1' */
 int find_em4100_header(uint8_t* bits, int len) {
-    if (len < 64) return -1;
-    for (int i = 0; i <= len - 64; i++) {
-        if (i > 0 && bits[i - 1] == 1) {
-            continue; /* nine 1s must start a new run, not extend a longer run */
-        }
-        int ones = 0;
-        for (int j = 0; j < 9; j++) {
-            if (bits[i + j] == 1)
-                ones++;
-            else
-                break;
-        }
-        if (ones == 9) return i;
+  if (len < 64) return -1;
+  for (int i = 0; i <= len - 64; i++) {
+    if (i > 0 && bits[i - 1] == 1) continue;
+    int ones = 0;
+    for (int j = 0; j < 9; j++) {
+      if (bits[i + j] == 1)
+        ones++;
+      else
+        break;
     }
-    return -1;
-}
-
-static void em4100_max_runs(const uint8_t* bits, int len, int* max_ones,
-                            int* max_zeros) {
-    int best_o = 0;
-    int best_z = 0;
-    int run_o = 0;
-    int run_z = 0;
-
-    for (int i = 0; i < len; i++) {
-        if (bits[i] == 1) {
-            run_o++;
-            run_z = 0;
-            if (run_o > best_o) best_o = run_o;
-        } else {
-            run_z++;
-            run_o = 0;
-            if (run_z > best_z) best_z = run_z;
-        }
-    }
-    *max_ones = best_o;
-    *max_zeros = best_z;
+    if (ones == 9) return i;
+  }
+  return -1;
 }
 
 int EM4100_Full_Check(uint8_t* bits) {
-    /* Without this, try_em4100_slide matches random windows (parity is linear). */
-    for (int j = 0; j < 9; j++) {
-        if (bits[j] != 1) return 0;
-    }
-    /* Stop bit */
-    if (bits[63] != 0) return 0;
+  for (int j = 0; j < 9; j++)
+    if (bits[j] != 1) return 0;
+  if (bits[63] != 0) return 0;
 
-    uint8_t col_parity[4] = {0};
-
-    // 檢查 10 組 Row (Customer ID + Data)
-    for (int row = 0; row < 10; row++) {
-        int base = 9 + row * 5;
-        int row_sum = 0;
-        for (int col = 0; col < 4; col++) {
-            uint8_t val = bits[base + col];
-            row_sum += val;
-            col_parity[col] += val;
-        }
-        // 偶同位檢查：數據和 + 同位位元
-        if ((row_sum + bits[base + 4]) % 2 != 0) return 0;
-    }
-
-    // 檢查 Column Parity
+  uint8_t col_parity[4] = {0};
+  for (int row = 0; row < 10; row++) {
+    int base = 9 + row * 5;
+    int row_sum = 0;
     for (int col = 0; col < 4; col++) {
-        if ((col_parity[col] + bits[59 + col]) % 2 != 0) return 0;
+      uint8_t val = bits[base + col];
+      row_sum += val;
+      col_parity[col] += val;
     }
-    return 1;
+    if ((row_sum + bits[base + 4]) % 2 != 0) return 0;
+  }
+  for (int col = 0; col < 4; col++) {
+    if ((col_parity[col] + bits[59 + col]) % 2 != 0) return 0;
+  }
+  return 1;
 }
 
-/* Preamble aligned to field boundary (bit before frame must be 0 when present). */
 static int em4100_valid_at(const uint8_t* bits, int len, int off) {
-    if (off < 0 || off + 64 > len) return 0;
-    if (off > 0 && bits[off - 1] != 0) return 0;
-    return EM4100_Full_Check((uint8_t*)&bits[off]);
+  if (off < 0 || off + 64 > len) return 0;
+  if (off > 0 && bits[off - 1] != 0) return 0;
+  return EM4100_Full_Check((uint8_t*)&bits[off]);
 }
 
 uint64_t decode_card_code(uint8_t* bits) {
-    uint64_t code = 0;
-    for (int j = 0; j < 10; j++) {
-        unsigned int digit =
-            (bits[9 + 5 * j] << 3) | (bits[9 + 5 * j + 1] << 2) |
-            (bits[9 + 5 * j + 2] << 1) | (bits[9 + 5 * j + 3] << 0);
-        code |= ((uint64_t)digit << (4 * (9 - j)));
-    }
-    return (code & 0xFFFFFFFF);
+  uint64_t code = 0;
+  for (int j = 0; j < 10; j++) {
+    unsigned int digit = (bits[9 + 5 * j] << 3) | (bits[9 + 5 * j + 1] << 2) |
+                         (bits[9 + 5 * j + 2] << 1) |
+                         (bits[9 + 5 * j + 3] << 0);
+    code |= ((uint64_t)digit << (4 * (9 - j)));
+  }
+  return (code & 0xFFFFFFFF);
 }
 
-/*
- * Slide a 64-bit window; em4100_valid_at adds bit-before-preamble==0 + Full_Check.
- */
 static int try_em4100_slide(const uint8_t* bits, int len, uint64_t* out_code) {
-    if (len < 64) return -1;
-    for (int i = 0; i <= len - 64; i++) {
-        if (em4100_valid_at(bits, len, i)) {
-            *out_code = decode_card_code((uint8_t*)&bits[i]);
-            return i;
-        }
+  if (len < 64) return -1;
+  for (int i = 0; i <= len - 64; i++) {
+    if (em4100_valid_at(bits, len, i)) {
+      *out_code = decode_card_code((uint8_t*)&bits[i]);
+      return i;
     }
-    return -1;
-}
-
-/* 9-run of 1s is not unique; try small bit slip around that index. */
-static int try_em4100_near_header(const uint8_t* bits, int len, int h,
-                                  uint64_t* out_code) {
-    const int span = 16;
-
-    if (len < 64 || h < 0) return -1;
-    for (int d = -span; d <= span; d++) {
-        int i = h + d;
-
-        if (i < 0 || i + 64 > len) continue;
-        if (em4100_valid_at(bits, len, i)) {
-            *out_code = decode_card_code((uint8_t*)&bits[i]);
-            return i;
-        }
-    }
-    return -1;
+  }
+  return -1;
 }
 
 void decode_bitstream(uint16_t total_ticks, uint8_t* out_bits, int* out_len) {
-    int bit_idx = 0;
-    uint8_t current_val = 1;
-    int state = 0;
+  int bit_idx = 0;
+  uint8_t current_val = 1;
+  int state = 0;
 
-    memset(out_bits, 0, EM_DECODED_BITS_CAP);
-    *out_len = 0;
+  memset(out_bits, 0, EM_DECODED_BITS_CAP);
+  *out_len = 0;
 
-    for (int i = 0; i < total_ticks; i++) {
-        uint32_t T = tick_buffer[i];
-        if (T < EM_EDGE_MIN_US) continue;
+  for (int i = 0; i < total_ticks; i++) {
+    uint32_t T = tick_buffer[i];
+    if (T < EM_EDGE_MIN_US) continue;
 
-        if (T >= EM_LONG_MIN && T <= EM_LONG_MAX) {
-            current_val = !current_val;
-            if (bit_idx < EM_DECODED_BITS_CAP) out_bits[bit_idx++] = current_val;
-            state = 0;
-        } else if (T >= EM_SHORT_MIN && T <= EM_SHORT_MAX) {
-            if (state == 0) {
-                state = 1;
-            } else {
-                if (bit_idx < EM_DECODED_BITS_CAP) out_bits[bit_idx++] = current_val;
-                state = 0;
-            }
-        } else if (T > EM_LONG_MAX && T < EM_MANCHESTER_GAP_HOLD_US) {
-            /* Between-bit / AFE dropout; do not treat as symbol (avoids
-             * constant resync) */
-        } else if (T >= EM_MANCHESTER_RESYNC_US) {
-            state = 0;
-        } else {
-            state = 0;
-        }
+    if (T >= EM_LONG_MIN && T <= EM_LONG_MAX) {
+      current_val = !current_val;
+      if (bit_idx < EM_DECODED_BITS_CAP) out_bits[bit_idx++] = current_val;
+      state = 0;
+    } else if (T >= EM_SHORT_MIN && T <= EM_SHORT_MAX) {
+      if (state == 0) {
+        state = 1;
+      } else {
+        if (bit_idx < EM_DECODED_BITS_CAP) out_bits[bit_idx++] = current_val;
+        state = 0;
+      }
+    } else {
+      state = 0;
     }
-    *out_len = bit_idx;
+  }
+  *out_len = bit_idx;
 }
 
 static void tick_buffer_append(uint32_t diff_us, int* demod_counter,
                                bool* tick_window_slid) {
-    if (*demod_counter >= TICK_BUFFER_SIZE) {
-        const size_t half = TICK_BUFFER_SIZE / 2;
-
-        memmove(tick_buffer, tick_buffer + half, half * sizeof(tick_buffer[0]));
-        *demod_counter = (int)half;
-        *tick_window_slid = true;
-    }
-    tick_buffer[(*demod_counter)++] = diff_us;
+  if (*demod_counter >= TICK_BUFFER_SIZE) {
+    const size_t half = TICK_BUFFER_SIZE / 2;
+    memmove(tick_buffer, tick_buffer + half, half * sizeof(tick_buffer[0]));
+    *demod_counter = (int)half;
+    *tick_window_slid = true;
+  }
+  tick_buffer[(*demod_counter)++] = diff_us;
 }
 
 int em4095_comp_receiver(void) {
-    int demod_counter = 0;
-    uint32_t raw_edges = 0;
-    uint32_t max_gap_us = 0;
+  int demod_counter = 0;
+  uint32_t raw_edges = 0;
+  uint32_t max_gap_us = 0;
+  uint32_t gap_lt_100 = 0;
+  uint32_t gap_100_230 = 0;
+  uint32_t gap_231_520 = 0;
+  uint32_t gap_gt_520 = 0;
 
-    LOG_DBG("scan start");
+  if (!device_is_ready(comp_dev)) return 0;
 
-    if (!device_is_ready(comp_dev)) return 0;
-#if RFID_ENABLE_CARRIER_PWM
-    if (!device_is_ready(pwm_dev)) {
-        LOG_ERR("pwm not ready");
-        return 0;
-    }
-#endif
+  k_sleep(K_MSEC(50));
 
-    if (comparator_set_trigger(comp_dev, COMPARATOR_TRIGGER_NONE) != 0) {
-        LOG_ERR("comparator_set_trigger failed");
-        return 0;
-    }
+  int stable = comparator_get_output(comp_dev);
+  uint8_t last_val = (stable > 0) ? 1 : 0;
+  uint32_t t0 = k_cycle_get_32();
+  uint32_t last_phy_cycle = t0;
+  uint32_t last_accepted_cycle = t0;
+  uint64_t stop_time = k_uptime_get() + RFID_CAPTURE_WINDOW_MS;
+  bool lead_sync_dropped = false;
+  bool tick_window_slid = false;
 
-#if RFID_ENABLE_CARRIER_PWM
-    pwm_set_cycles(pwm_dev, 0, PWM_PERIOD, RFID_50_PERCENT_DUTY, 0);
-    pwm_set_cycles(pwm_dev, 1, PWM_PERIOD, RFID_50_PERCENT_DUTY,
-                   PWM_POLARITY_INVERTED);
-#endif
+  while (k_uptime_get() < stop_time) {
+    int current_val = comparator_get_output(comp_dev);
+    if (current_val < 0) continue;
 
-    k_sleep(K_MSEC(50));
+    if (current_val != last_val) {
+      uint32_t now = k_cycle_get_32();
+      uint32_t diff_phy = k_cyc_to_us_near32(now - last_phy_cycle);
 
-    int stable = comparator_get_output(comp_dev);
-    uint8_t last_val = (stable > 0) ? 1 : 0;
-    uint32_t last_edge_cycle = k_cycle_get_32();
-    /* EM4100 會重複送框；約 400ms 採樣視窗 */
-    uint64_t stop_time = k_uptime_get() + RFID_CAPTURE_WINDOW_MS;
-    /*
-     * Drop at most ONE leading interval > EM_SKIP_FIRST_GAP_US (idle after
-     * arm). Do NOT use demod_counter==0 for this: buffer stays empty until
-     * first store, so a second long gap would be wrongly skipped forever
-     * (stored << raw_edges).
-     */
-    bool lead_sync_dropped = false;
-    bool tick_window_slid = false;
+      raw_edges++;
+      if (diff_phy > max_gap_us) max_gap_us = diff_phy;
+      if (diff_phy < 100) {
+        gap_lt_100++;
+      } else if (diff_phy <= 230) {
+        gap_100_230++;
+      } else if (diff_phy <= 520) {
+        gap_231_520++;
+      } else {
+        gap_gt_520++;
+      }
+      last_phy_cycle = now;
 
-    while (k_uptime_get() < stop_time) {
-        int current_val = comparator_get_output(comp_dev);
-        if (current_val < 0) continue;
-
-        if (current_val != last_val) {
-            uint32_t now = k_cycle_get_32();
-            uint32_t diff_us = k_cyc_to_us_near32(now - last_edge_cycle);
-
-            raw_edges++;
-            if (diff_us > max_gap_us) {
-                max_gap_us = diff_us;
-            }
-            if (diff_us > EM_EDGE_MIN_US) {
-                if (!lead_sync_dropped) {
-                    lead_sync_dropped = true;
-                    if (diff_us <= EM_SKIP_FIRST_GAP_US) {
-                        tick_buffer_append(diff_us, &demod_counter,
-                                           &tick_window_slid);
-                    }
-                } else {
-                    tick_buffer_append(diff_us, &demod_counter, &tick_window_slid);
-                }
-            }
-            last_edge_cycle = now;
-            last_val = current_val;
+      /* 僅在距「上次採納邊緣」夠遠時記錄 gap；短間隔仍同步
+       * last_val，避免載波毛刺造成忙等 */
+      uint32_t diff_acc = k_cyc_to_us_near32(now - last_accepted_cycle);
+      if (diff_acc > EM_EDGE_MIN_US) {
+        if (!lead_sync_dropped) {
+          lead_sync_dropped = true;
+          if (diff_acc <= EM_SKIP_FIRST_GAP_US) {
+            tick_buffer_append(diff_acc, &demod_counter, &tick_window_slid);
+          }
+        } else {
+          tick_buffer_append(diff_acc, &demod_counter, &tick_window_slid);
         }
+        last_accepted_cycle = now;
+      }
+      last_val = (uint8_t)(current_val > 0 ? 1 : 0);
     }
+  }
 
-    if (tick_window_slid) {
-        LOG_WRN(
-            "High edge rate: tick window slid (oldest half discarded when "
-            "full); decode uses last ~%d stored intervals",
-            demod_counter);
+  LOG_INF("scan: raw_edges=%u stored=%d max_gap_us=%u", raw_edges,
+          demod_counter, max_gap_us);
+  LOG_INF("gap_hist: <100=%u 100-230=%u 231-520=%u >520=%u", gap_lt_100,
+          gap_100_230, gap_231_520, gap_gt_520);
+
+  if (demod_counter >= EM_MIN_STORED_TO_DECODE) {
+    int raw_len = 0;
+    decode_bitstream(demod_counter, dec_raw_bits, &raw_len);
+    LOG_INF("Captured: %d ticks, Decoded: %d bits", demod_counter, raw_len);
+
+    uint64_t code;
+    // 嘗試正向
+    int slide = try_em4100_slide(dec_raw_bits, raw_len, &code);
+    if (slide >= 0) {
+      LOG_WRN("[SUCCESS] ID: %08llX", code);
+      return 1;
     }
-    LOG_INF("scan: raw_edges=%u stored=%d max_gap_us=%u (decode if stored>=%d)",
-            raw_edges, demod_counter, max_gap_us, EM_MIN_STORED_TO_DECODE);
-    if (raw_edges > 80 && demod_counter < EM_MIN_STORED_TO_DECODE) {
-        LOG_WRN(
-            "Most edge gaps <= EM_EDGE_MIN_US (carrier ripple or threshold too "
-            "high); "
-            "lower EM_EDGE_MIN_US or improve analog envelope");
-    }
-    if (raw_edges == 0) {
-        LOG_WRN(
-            "No edges: check EN/3V3_LF, CMP_P/CMP_N, carrier at coil, COMP "
-            "enabled");
+    // 嘗試反轉
+    invert_bits(dec_raw_bits, raw_len);
+    slide = try_em4100_slide(dec_raw_bits, raw_len, &code);
+    if (slide >= 0) {
+      LOG_WRN("[SUCCESS-Inv] ID: %08llX", code);
+      return 1;
     }
 
-#if RFID_ENABLE_CARRIER_PWM
-    pwm_set_cycles(pwm_dev, 0, PWM_PERIOD, 0, 0);
-    pwm_set_cycles(pwm_dev, 1, PWM_PERIOD, 0, 0);
-#endif
+    LOG_INF("Fingerprint: %u, %u, %u, %u, %u, %u, %u, %u, %u, %u",
+            tick_buffer[0], tick_buffer[1], tick_buffer[2], tick_buffer[3],
+            tick_buffer[4], tick_buffer[5], tick_buffer[6], tick_buffer[7],
+            tick_buffer[8], tick_buffer[9]);
+  }
+  return 0;
+}
 
-    if (demod_counter >= EM_MIN_STORED_TO_DECODE) {
-        int in_short = 0;
-        int in_long = 0;
-        int in_other = 0;
-
-        for (int i = 0; i < demod_counter; i++) {
-            uint32_t T = tick_buffer[i];
-
-            if (T < EM_EDGE_MIN_US) {
-                continue;
-            }
-            if (T >= EM_LONG_MIN && T <= EM_LONG_MAX) {
-                in_long++;
-            } else if (T >= EM_SHORT_MIN && T <= EM_SHORT_MAX) {
-                in_short++;
-            } else {
-                in_other++;
-            }
-        }
-
-        int raw_len = 0;
-        decode_bitstream(demod_counter, dec_raw_bits, &raw_len);
-
-        LOG_INF(
-            "Captured: %d ticks, Decoded: %d bits, buckets short/long/other: "
-            "%d/%d/%d",
-            demod_counter, raw_len, in_short, in_long, in_other);
-        if (raw_len >= EM_DECODED_BITS_CAP) {
-            LOG_WRN("Decoded bit stream at cap (%d); late frames may be missing",
-                    EM_DECODED_BITS_CAP);
-        }
-
-        if (raw_len < 64) {
-            LOG_INF(
-                "Bits < 64: pulse widths mostly outside SHORT/LONG; tune "
-                "EM_SHORT_* / "
-                "EM_LONG_* from buckets (RF/64 ~256us half-bit, ~512us "
-                "full-bit scale)");
-        }
-
-        memcpy(dec_saved_bits, dec_raw_bits, (size_t)raw_len);
-
-        int max_o;
-        int max_z;
-        em4100_max_runs(dec_saved_bits, raw_len, &max_o, &max_z);
-        LOG_INF(
-            "Bit stream: max run ones=%d zeros=%d (EM4100 preamble needs 9 "
-            "ones)",
-            max_o, max_z);
-        if (max_o < 9) {
-            LOG_WRN(
-                "No EM4100-like preamble: raise EM_EDGE_MIN_US, fix analog "
-                "filter/resonance, "
-                "or verify EM4100 tag + 125kHz field");
-        }
-
-        /* Normal polarity */
-        int hn = find_em4100_header(dec_saved_bits, raw_len);
-        if (hn >= 0) {
-            if (em4100_valid_at(dec_saved_bits, raw_len, hn)) {
-                LOG_WRN("Card ID: %08llX",
-                        decode_card_code(&dec_saved_bits[hn]));
-                return 1;
-            }
-            LOG_INF("Header at %d but parity/stop check failed", hn);
-            uint64_t code_near;
-            int nn =
-                try_em4100_near_header(dec_saved_bits, raw_len, hn, &code_near);
-            if (nn >= 0) {
-                LOG_WRN("Card ID (near hdr %d -> %d): %08llX", hn, nn,
-                        code_near);
-                return 1;
-            }
-        }
-
-        /* Inverted copy */
-        memcpy(dec_work_bits, dec_saved_bits, (size_t)raw_len);
-        invert_bits(dec_work_bits, raw_len);
-        int hi = find_em4100_header(dec_work_bits, raw_len);
-        if (hi >= 0) {
-            if (em4100_valid_at(dec_work_bits, raw_len, hi)) {
-                LOG_WRN("Card ID (inverted): %08llX",
-                        decode_card_code(&dec_work_bits[hi]));
-                return 1;
-            }
-            LOG_INF("Header (inverted) at %d but parity/stop check failed", hi);
-            uint64_t code_near_inv;
-            int ni = try_em4100_near_header(dec_work_bits, raw_len, hi,
-                                            &code_near_inv);
-            if (ni >= 0) {
-                LOG_WRN("Card ID (near inv hdr %d -> %d): %08llX", hi, ni,
-                        code_near_inv);
-                return 1;
-            }
-        }
-
-        if (hn < 0 && hi < 0) {
-            LOG_INF("No 9-run header; trying sliding 64-bit parity match");
-        }
-
-        uint64_t code;
-        int slide = try_em4100_slide(dec_saved_bits, raw_len, &code);
-        if (slide >= 0) {
-            LOG_WRN("Card ID (slide offset %d): %08llX", slide, code);
-            return 1;
-        }
-        memcpy(dec_work_bits, dec_saved_bits, (size_t)raw_len);
-        invert_bits(dec_work_bits, raw_len);
-        slide = try_em4100_slide(dec_work_bits, raw_len, &code);
-        if (slide >= 0) {
-            LOG_WRN("Card ID (slide inv offset %d): %08llX", slide, code);
-            return 1;
-        }
-
-        /* Fingerprint of first five stored intervals (us) */
-        LOG_INF("Fingerprint: %u, %u, %u, %u, %u", tick_buffer[0],
-                tick_buffer[1], tick_buffer[2], tick_buffer[3], tick_buffer[4]);
-    }
-    return 0;
+/* 參數須與 app.overlay &comp 一致：SE + VDD 參考 + th_down/th_up 門檻。 */
+static void comp_reapply_se_threshold(void) {
+  if (!device_is_ready(comp_dev)) return;
+  const struct comp_nrf_comp_se_config cfg = {
+      .psel = COMP_NRF_COMP_PSEL_AIN2,
+      .sp_mode = COMP_NRF_COMP_SP_MODE_HIGH,
+      .isource = COMP_NRF_COMP_ISOURCE_DISABLED,
+      .extrefsel = COMP_NRF_COMP_EXTREFSEL_AIN3,
+      .refsel = COMP_NRF_COMP_REFSEL_VDD,
+      .th_down = 23,
+      .th_up = 25,
+  };
+  int r = comp_nrf_comp_configure_se(comp_dev, &cfg);
+  if (r != 0) {
+    LOG_WRN("comp re-apply se threshold failed: %d", r);
+  } else {
+    LOG_INF("COMP: SE ref=VDD th=[33,35] applied");
+  }
 }
 
 int main(void) {
-    LOG_INF("nRF5340 Discrete RFID Starting...");
-    LOG_INF(
-        "Tuning: edge_min_us=%u min_stored=%u capture_ms=%u (if scan line "
-        "differs, rebuild/flash)",
-        EM_EDGE_MIN_US, EM_MIN_STORED_TO_DECODE, RFID_CAPTURE_WINDOW_MS);
-    while (1) {
-        if (!em4095_comp_receiver()) {
-            LOG_INF("No card detected.");
-        }
-        k_sleep(K_MSEC(1500));
+  int dppi_ret;
+
+  LOG_INF("nRF5340 Discrete RFID Starting...");
+
+  comp_reapply_se_threshold();
+
+  dppi_ret = start_carrier_with_dppi_deadtime();
+  if (dppi_ret == 0) {
+    LOG_INF("Carrier DPPI wave started.");
+  } else {
+    LOG_ERR("Carrier DPPI wave start failed, ret=%d", dppi_ret);
+  }
+
+  while (1) {
+    if (!em4095_comp_receiver()) {
+      LOG_INF("No card detected.");
     }
-    return 0;
+    k_sleep(K_MSEC(1500));
+  }
+  return 0;
 }
