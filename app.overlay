@@ -7,7 +7,7 @@
 };
 
 &pwm0 {
-    /* 載波改由 main.c 的 TIMER+DPPI+GPIOTE 驅動，避免與 P1.09/P1.10 衝突 */
+    /* 載波改由 main.c 的 nrfx_pwm 直接驅動，避免 Zephyr PWM 驅動重複占用 pin */
     status = "disabled";
     pinctrl-0 = <&pwm0_default>;
     pinctrl-1 = <&pwm0_sleep>;
@@ -35,11 +35,9 @@
 
 &comp {
     status = "okay";
-    main-mode = "SE";       /* 單端模式：比較 psel 與內部參考 */
-    psel = "AIN2";          /* 對應 P0.06，接 RFID 訊號 */
-    refsel = "VDD";         /* 內部分壓參考（VDD ladder） */
-    th-down = <23>;         /* 約 33/64 * VDD */
-    th-up = <25>;           /* 約 35/64 * VDD */
+    main-mode = "DIFF";     /* 差動模式：AIN2 vs AIN3 */
+    psel = "AIN2";          /* 對應 P0.06 */
+    extrefsel = "AIN3";     /* 對應 P0.07 */
     sp-mode = "HIGH";       /* 高速模式 */
     enable-hyst;            /* 保留遲滯 */
     isource = "DISABLED";   /* 關閉內部電流源 */

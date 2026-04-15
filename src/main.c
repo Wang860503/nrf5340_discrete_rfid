@@ -5,11 +5,8 @@
  */
 
 #include <errno.h>
-#include <hal/nrf_gpiote.h>
-#include <hal/nrf_timer.h>
-#include <nrfx_dppi.h>
-#include <nrfx_gpiote.h>
-#include <nrfx_timer.h>
+#include <hal/nrf_gpio.h>
+#include <nrfx_pwm.h>
 #include <string.h>
 #include <zephyr/device.h>
 #include <zephyr/devicetree.h>
@@ -20,19 +17,16 @@
 
 #if DT_NODE_EXISTS(DT_NODELABEL(comp)) && \
     DT_NODE_HAS_STATUS(DT_NODELABEL(comp), okay)
-BUILD_ASSERT(
-    DT_PROP(DT_NODELABEL(comp), enable_hyst) != 0,
-    "app.overlay: &comp 請保留 enable-hyst（nRF5340 差動模式即晶片最大遲滯）");
+BUILD_ASSERT(DT_PROP(DT_NODELABEL(comp), enable_hyst) != 0,
+             "app.overlay: &comp 請保留 enable-hyst");
 #endif
 
 LOG_MODULE_REGISTER(rfid_main);
 
-/* 載波：計時器在 PWM_PERIOD tick CLEAR → 125kHz；A 延後開啟騰出 B→A 死區 */
-#define PWM_PERIOD 128
-#define RFID_DEAD_TICKS 44
-#define RFID_CH_A_ON_LEAD 26U /* 約 1.25µs @ 16MHz；與 2*dead 幾何搭配 */
-#define RFID_GPIOTE_PIN_A 41  /* P1.09 */
-#define RFID_GPIOTE_PIN_B 42  /* P1.10 */
+/* PWM 載波：DAMP(center-aligned) 下 f = 16MHz / (2 * TOP)，TOP=64 => 125kHz */
+#define RFID_PWM_TOP 64U
+#define RFID_PWM_CH_A 25U
+#define RFID_PWM_CH_B 32U
 #define TICK_BUFFER_SIZE 2048
 #define EM_DECODED_BITS_CAP 1024
 
@@ -56,207 +50,72 @@ LOG_MODULE_REGISTER(rfid_main);
 #define EM_MANCHESTER_RESYNC_US 15000
 
 static const struct device* comp_dev = DEVICE_DT_GET(DT_NODELABEL(comp));
-static const nrfx_timer_t rfid_timer = NRFX_TIMER_INSTANCE(2);
-static const nrfx_gpiote_t rfid_gpiote = NRFX_GPIOTE_INSTANCE(0);
-static const nrfx_dppi_t rfid_dppi = NRFX_DPPI_INSTANCE(0);
+static const nrfx_pwm_t rfid_pwm = NRFX_PWM_INSTANCE(0);
+static nrf_pwm_values_individual_t rfid_seq_values[] = {
+    {
+        .channel_0 = (uint16_t)(RFID_PWM_CH_A | 0x8000U),
+        .channel_1 = (uint16_t)(RFID_PWM_CH_B | 0x8000U),
+        .channel_2 = 0,
+        .channel_3 = 0,
+    },
+};
+static const nrf_pwm_sequence_t rfid_seq = {
+    .values.p_individual = rfid_seq_values,
+    .length = NRF_PWM_VALUES_LENGTH(rfid_seq_values),
+    .repeats = 0,
+    .end_delay = 0,
+};
 
 static uint32_t tick_buffer[TICK_BUFFER_SIZE];
 static uint8_t dec_raw_bits[EM_DECODED_BITS_CAP];
+static bool pwm_ready;
+static bool carrier_running;
 
-static bool nrfx_ok_or_already(nrfx_err_t err) {
-  return (err == NRFX_SUCCESS) || (err == NRFX_ERROR_INVALID_STATE) ||
-         (err == NRFX_ERROR_ALREADY);
-}
-
-static int start_carrier_with_dppi_deadtime(void) {
-  uint32_t ch_a_on;
-  uint32_t ch_a_off;
-  uint32_t ch_b_on;
-  uint32_t ch_b_off;
-  uint32_t active_ticks_a;
-  uint32_t active_ticks_b;
-  uint8_t te_ch_a;
-  uint8_t te_ch_b;
-  uint8_t dppi_ch_a_on;
-  uint8_t dppi_ch_a_off;
-  uint8_t dppi_ch_b_on;
-  uint8_t dppi_ch_b_off;
+static int start_carrier_with_pwm(void) {
   nrfx_err_t err;
 
-  LOG_INF("dppi: setup enter dead=%u period=%u lead_A=%u", RFID_DEAD_TICKS,
-          PWM_PERIOD, RFID_CH_A_ON_LEAD);
+  if (!pwm_ready) {
+    nrfx_pwm_config_t const config = {
+        .output_pins =
+            {
+                NRF_GPIO_PIN_MAP(1, 9),  /* P1.09 */
+                NRF_GPIO_PIN_MAP(1, 10), /* P1.10 */
+                NRF_PWM_PIN_NOT_CONNECTED,
+                NRF_PWM_PIN_NOT_CONNECTED,
+            },
+        .irq_priority = NRFX_PWM_DEFAULT_CONFIG_IRQ_PRIORITY,
+        .base_clock = NRF_PWM_CLK_16MHz,
+        .count_mode = NRF_PWM_MODE_UP_AND_DOWN,
+        .top_value = RFID_PWM_TOP,
+        .load_mode = NRF_PWM_LOAD_INDIVIDUAL,
+        .step_mode = NRF_PWM_STEP_AUTO,
+        .skip_gpio_cfg = false,
+        .skip_psel_cfg = false,
+    };
 
-  /* 125kHz / 對稱死區幾何：總導通 = PWM - 2*dead，A 延後 RFID_CH_A_ON_LEAD 再開
-   */
-  {
-    uint32_t total_active = PWM_PERIOD - (RFID_DEAD_TICKS * 2U);
-    if (total_active < 4U) {
-      LOG_ERR("dead too long for period (2*dead=%u period=%u)",
-              2U * RFID_DEAD_TICKS, PWM_PERIOD);
-      return -EINVAL;
+    err = nrfx_pwm_init(&rfid_pwm, &config, NULL, NULL);
+    if (!(err == NRFX_SUCCESS || err == NRFX_ERROR_ALREADY ||
+          err == NRFX_ERROR_INVALID_STATE)) {
+      LOG_ERR("pwm init failed: %d", err);
+      return -EIO;
     }
-    active_ticks_a = total_active / 2U;
-    active_ticks_b = total_active - active_ticks_a;
-    ch_a_on = RFID_CH_A_ON_LEAD;
-    ch_a_off = ch_a_on + active_ticks_a;
-    ch_b_on = ch_a_off + RFID_DEAD_TICKS;
-    ch_b_off = ch_b_on + active_ticks_b;
-    if (ch_b_off > PWM_PERIOD) {
-      LOG_ERR("ch_b_off %u > PWM_PERIOD %u (增大 lead 或減 dead)", ch_b_off,
-              PWM_PERIOD);
-      return -EINVAL;
-    }
+    pwm_ready = true;
   }
 
-  /* Zephyr gpio_nrfx 會先 init GPIOTE0，此處再呼叫會得到
-   * NRFX_ERROR_ALREADY（須視為成功） */
-  err = nrfx_gpiote_init(&rfid_gpiote, NRFX_GPIOTE_DEFAULT_CONFIG_IRQ_PRIORITY);
-  if (!nrfx_ok_or_already(err)) {
-    LOG_ERR("gpiote_init failed: %d", err);
-    return -EIO;
+  if (!carrier_running) {
+    (void)nrfx_pwm_simple_playback(&rfid_pwm, &rfid_seq, 1, NRFX_PWM_FLAG_LOOP);
+    carrier_running = true;
   }
 
-  err = nrfx_gpiote_channel_alloc(&rfid_gpiote, &te_ch_a);
-  if (err != NRFX_SUCCESS) {
-    LOG_ERR("gpiote ch alloc A: %d", err);
-    return -ENOMEM;
-  }
-  err = nrfx_gpiote_channel_alloc(&rfid_gpiote, &te_ch_b);
-  if (err != NRFX_SUCCESS) {
-    LOG_ERR("gpiote ch alloc B: %d", err);
-    return -ENOMEM;
-  }
-
-  nrfx_gpiote_output_config_t out_cfg = {
-      .drive = NRF_GPIO_PIN_H0H1,
-      .input_connect = NRF_GPIO_PIN_INPUT_DISCONNECT,
-      .pull = NRF_GPIO_PIN_NOPULL,
-  };
-  /* Task 模式 + LoToHi：由 DPPI 改訂閱 SET/CLR（非 OUT
-   * toggle），避免漏脈衝造成相位反轉 */
-  nrfx_gpiote_task_config_t task_a = {
-      .task_ch = te_ch_a,
-      .polarity = NRF_GPIOTE_POLARITY_LOTOHI,
-      .init_val = NRF_GPIOTE_INITIAL_VALUE_LOW,
-  };
-  nrfx_gpiote_task_config_t task_b = {
-      .task_ch = te_ch_b,
-      .polarity = NRF_GPIOTE_POLARITY_LOTOHI,
-      .init_val = NRF_GPIOTE_INITIAL_VALUE_LOW,
-  };
-
-  err = nrfx_gpiote_output_configure(&rfid_gpiote, RFID_GPIOTE_PIN_A, &out_cfg,
-                                     &task_a);
-  if (err != NRFX_SUCCESS) {
-    LOG_ERR("gpiote out cfg A pin=%u: %d", (unsigned)RFID_GPIOTE_PIN_A, err);
-    return -EIO;
-  }
-  err = nrfx_gpiote_output_configure(&rfid_gpiote, RFID_GPIOTE_PIN_B, &out_cfg,
-                                     &task_b);
-  if (err != NRFX_SUCCESS) {
-    LOG_ERR("gpiote out cfg B pin=%u: %d", (unsigned)RFID_GPIOTE_PIN_B, err);
-    return -EIO;
-  }
-
-  nrfx_gpiote_out_clear(&rfid_gpiote, RFID_GPIOTE_PIN_A);
-  nrfx_gpiote_out_clear(&rfid_gpiote, RFID_GPIOTE_PIN_B);
-
-  /* 以 channel index 啟用 Task（避免 nrfx 依 pin 查表時與 Zephyr
-   * 內部狀態不一致） */
-  nrf_gpiote_task_enable(rfid_gpiote.p_reg, te_ch_a);
-  nrf_gpiote_task_enable(rfid_gpiote.p_reg, te_ch_b);
-  LOG_INF("dppi: gpiote TE ch=%u,%u enabled", te_ch_a, te_ch_b);
-
-  if (ch_b_off < PWM_PERIOD && rfid_timer.cc_channel_count < 5U) {
-    LOG_ERR("TIMER2 needs >=5 CC (B_CLR@ch_b_off=%u, CLEAR@%u)", ch_b_off,
-            PWM_PERIOD);
-    return -ENOTSUP;
-  }
-
-  /* NRFX_TIMER_DEFAULT_CONFIG 要的是 Hz，勿用
-   * nrf_timer_frequency_t（NRF_TIMER_FREQ_16MHz==0 會除零） */
-  nrfx_timer_config_t timer_cfg = NRFX_TIMER_DEFAULT_CONFIG(16000000U);
-  err = nrfx_timer_init(&rfid_timer, &timer_cfg, NULL);
-  if (!nrfx_ok_or_already(err)) {
-    LOG_ERR("timer_init failed: %d", err);
-    return -EIO;
-  }
-
-  nrfx_timer_clear(&rfid_timer);
-  nrfx_timer_extended_compare(&rfid_timer, NRF_TIMER_CC_CHANNEL0, ch_a_on, 0,
-                              false);
-  nrfx_timer_extended_compare(&rfid_timer, NRF_TIMER_CC_CHANNEL1, ch_a_off, 0,
-                              false);
-  nrfx_timer_extended_compare(&rfid_timer, NRF_TIMER_CC_CHANNEL2, ch_b_on, 0,
-                              false);
-  /* B 關在 ch_b_off；週期務必在 PWM_PERIOD 才 CLEAR（ch_b_off<128 時須 CC4） */
-  if (ch_b_off < PWM_PERIOD) {
-    nrfx_timer_extended_compare(&rfid_timer, NRF_TIMER_CC_CHANNEL3, ch_b_off, 0,
-                                false);
-    nrfx_timer_extended_compare(&rfid_timer, NRF_TIMER_CC_CHANNEL4, PWM_PERIOD,
-                                NRF_TIMER_SHORT_COMPARE4_CLEAR_MASK, false);
-  } else {
-    nrfx_timer_extended_compare(&rfid_timer, NRF_TIMER_CC_CHANNEL3, ch_b_off,
-                                NRF_TIMER_SHORT_COMPARE3_CLEAR_MASK, false);
-  }
-
-  err = nrfx_dppi_channel_alloc(&rfid_dppi, &dppi_ch_a_on);
-  if (err != NRFX_SUCCESS) {
-    LOG_ERR("dppi alloc a_on: %d", err);
-    return -ENOMEM;
-  }
-  err = nrfx_dppi_channel_alloc(&rfid_dppi, &dppi_ch_a_off);
-  if (err != NRFX_SUCCESS) {
-    LOG_ERR("dppi alloc a_off: %d", err);
-    return -ENOMEM;
-  }
-  err = nrfx_dppi_channel_alloc(&rfid_dppi, &dppi_ch_b_on);
-  if (err != NRFX_SUCCESS) {
-    LOG_ERR("dppi alloc b_on: %d", err);
-    return -ENOMEM;
-  }
-  err = nrfx_dppi_channel_alloc(&rfid_dppi, &dppi_ch_b_off);
-  if (err != NRFX_SUCCESS) {
-    LOG_ERR("dppi alloc b_off: %d", err);
-    return -ENOMEM;
-  }
-
-  nrf_timer_publish_set(rfid_timer.p_reg, NRF_TIMER_EVENT_COMPARE0,
-                        dppi_ch_a_on);
-  nrf_gpiote_subscribe_set(rfid_gpiote.p_reg, nrf_gpiote_set_task_get(te_ch_a),
-                           dppi_ch_a_on);
-
-  nrf_timer_publish_set(rfid_timer.p_reg, NRF_TIMER_EVENT_COMPARE1,
-                        dppi_ch_a_off);
-  nrf_gpiote_subscribe_set(rfid_gpiote.p_reg, nrf_gpiote_clr_task_get(te_ch_a),
-                           dppi_ch_a_off);
-
-  nrf_timer_publish_set(rfid_timer.p_reg, NRF_TIMER_EVENT_COMPARE2,
-                        dppi_ch_b_on);
-  nrf_gpiote_subscribe_set(rfid_gpiote.p_reg, nrf_gpiote_set_task_get(te_ch_b),
-                           dppi_ch_b_on);
-
-  /* B_CLR 僅綁 CC3@ch_b_off；CC4@PWM_PERIOD 只做 TIMER CLEAR，不發 DPPI */
-  nrf_timer_publish_set(rfid_timer.p_reg, NRF_TIMER_EVENT_COMPARE3,
-                        dppi_ch_b_off);
-  nrf_gpiote_subscribe_set(rfid_gpiote.p_reg, nrf_gpiote_clr_task_get(te_ch_b),
-                           dppi_ch_b_off);
-
-  (void)nrfx_dppi_channel_enable(&rfid_dppi, dppi_ch_a_on);
-  (void)nrfx_dppi_channel_enable(&rfid_dppi, dppi_ch_a_off);
-  (void)nrfx_dppi_channel_enable(&rfid_dppi, dppi_ch_b_on);
-  (void)nrfx_dppi_channel_enable(&rfid_dppi, dppi_ch_b_off);
-
-  nrfx_timer_enable(&rfid_timer);
-
-  LOG_INF("DPPI carrier: pwm=%u dead=%u active=%u+%u b_off=%u tail=%u%s",
-          PWM_PERIOD, RFID_DEAD_TICKS, active_ticks_a, active_ticks_b, ch_b_off,
-          PWM_PERIOD - ch_b_off,
-          (ch_b_off < PWM_PERIOD) ? " CC4=CLEAR" : " CC3=CLEAR");
-  LOG_INF("Timing ticks: A[%u,%u] B[%u,%u] te=%u,%u dppi=%u,%u,%u,%u", ch_a_on,
-          ch_a_off, ch_b_on, ch_b_off, te_ch_a, te_ch_b, dppi_ch_a_on,
-          dppi_ch_a_off, dppi_ch_b_on, dppi_ch_b_off);
+  LOG_INF("PWM carrier ON: top=%u mode=DAMP ch=%u/%u (~125kHz)", RFID_PWM_TOP,
+          RFID_PWM_CH_A, RFID_PWM_CH_B);
   return 0;
+}
+
+static void stop_carrier_with_pwm(void) {
+  if (!pwm_ready || !carrier_running) return;
+  (void)nrfx_pwm_stop(&rfid_pwm, true);
+  carrier_running = false;
 }
 
 void invert_bits(uint8_t* bits, int len) {
@@ -466,44 +325,45 @@ int em4095_comp_receiver(void) {
   return 0;
 }
 
-/* 參數須與 app.overlay &comp 一致：SE + VDD 參考 + th_down/th_up 門檻。 */
-static void comp_reapply_se_threshold(void) {
+/* 參數須與 app.overlay &comp 一致：DIFF(AIN2 vs AIN3) + hysteresis。 */
+static void comp_reapply_diff_ain2_ain3(void) {
   if (!device_is_ready(comp_dev)) return;
-  const struct comp_nrf_comp_se_config cfg = {
+  const struct comp_nrf_comp_diff_config cfg = {
       .psel = COMP_NRF_COMP_PSEL_AIN2,
       .sp_mode = COMP_NRF_COMP_SP_MODE_HIGH,
       .isource = COMP_NRF_COMP_ISOURCE_DISABLED,
       .extrefsel = COMP_NRF_COMP_EXTREFSEL_AIN3,
-      .refsel = COMP_NRF_COMP_REFSEL_VDD,
-      .th_down = 23,
-      .th_up = 25,
+      .enable_hyst = true,
   };
-  int r = comp_nrf_comp_configure_se(comp_dev, &cfg);
+  int r = comp_nrf_comp_configure_diff(comp_dev, &cfg);
   if (r != 0) {
-    LOG_WRN("comp re-apply se threshold failed: %d", r);
+    LOG_WRN("comp re-apply diff AIN2/AIN3 failed: %d", r);
   } else {
-    LOG_INF("COMP: SE ref=VDD th=[33,35] applied");
+    LOG_INF("COMP: DIFF AIN2 vs AIN3 + hysteresis ON");
   }
 }
 
 int main(void) {
-  int dppi_ret;
+  int carrier_ret;
 
   LOG_INF("nRF5340 Discrete RFID Starting...");
 
-  comp_reapply_se_threshold();
-
-  dppi_ret = start_carrier_with_dppi_deadtime();
-  if (dppi_ret == 0) {
-    LOG_INF("Carrier DPPI wave started.");
-  } else {
-    LOG_ERR("Carrier DPPI wave start failed, ret=%d", dppi_ret);
-  }
+  comp_reapply_diff_ain2_ain3();
 
   while (1) {
+    carrier_ret = start_carrier_with_pwm();
+    if (carrier_ret != 0) {
+      LOG_ERR("Carrier PWM wave start failed, ret=%d", carrier_ret);
+      k_sleep(K_MSEC(1500));
+      continue;
+    }
+
     if (!em4095_comp_receiver()) {
       LOG_INF("No card detected.");
     }
+
+    /* 只在掃描窗口內發射，待機時關閉載波。 */
+    // stop_carrier_with_pwm();
     k_sleep(K_MSEC(1500));
   }
   return 0;
