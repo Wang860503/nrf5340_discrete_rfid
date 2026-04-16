@@ -25,8 +25,8 @@ LOG_MODULE_REGISTER(rfid_main);
 
 /* PWM 載波：DAMP(center-aligned) 下 f = 16MHz / (2 * TOP)，TOP=64 => 125kHz */
 #define RFID_PWM_TOP 64U
-#define RFID_PWM_CH_A 25U
-#define RFID_PWM_CH_B 32U
+#define RFID_PWM_CH_A 10U
+#define RFID_PWM_CH_B 53U /* 與 CH_A 相差 16 ticks，約 1us @ 16MHz */
 #define TICK_BUFFER_SIZE 2048
 #define EM_DECODED_BITS_CAP 1024
 
@@ -363,7 +363,7 @@ int main(void) {
     }
 
     /* 只在掃描窗口內發射，待機時關閉載波。 */
-    // stop_carrier_with_pwm();
+    stop_carrier_with_pwm();
     k_sleep(K_MSEC(1500));
   }
   return 0;
