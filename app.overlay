@@ -20,7 +20,7 @@
             /* 修改點：從 Port 0 改為 Port 1 */
             psels = <NRF_PSEL(PWM_OUT0, 1, 9)>,   /* P1.09 */
                     <NRF_PSEL(PWM_OUT1, 1, 10)>;  /* P1.10 */
-            nordic,drive-mode = <NRF_DRIVE_H0H1>;
+            nordic,drive-mode = <NRF_DRIVE_S0S1>;
         };
     };
 
@@ -33,12 +33,12 @@
     };
 };
 
+/*
+ * RFID_COMP_USE_NRFX_DIRECT=1 時由 main.c nrfx_comp 獨占，須 disabled 避免與 Zephyr 驅動搶 COMP。
+ * nrfx 路徑：AIN0(P0.04)=CMP_P 慢路(TP2)、AIN1(P0.05)=CMP_N 快路(TP3)，DIFF。
+ * 對齊 Mavericks/EFR32 ACMP0：快/慢包絡交叉 → DEMOD_OUT；非 125kHz 雙載波。
+ * RFID_COMP_DIRECT_EDGE_DECODE=1：COMP 邊緣間隔直接作 Manchester 半週期。
+ */
 &comp {
-    status = "okay";
-    main-mode = "DIFF";     /* 差動模式：AIN2 vs AIN3 */
-    psel = "AIN2";          /* 對應 P0.06 */
-    extrefsel = "AIN3";     /* 對應 P0.07 */
-    sp-mode = "HIGH";       /* 高速模式 */
-    enable-hyst;            /* 保留遲滯 */
-    isource = "DISABLED";   /* 關閉內部電流源 */
+    status = "disabled";
 };
