@@ -25,6 +25,22 @@
 
 LOG_MODULE_REGISTER(rfid_main);
 
+/* ==================== 解碼模式切換 ==================== */
+#define DECODE_MODE_ASK 0
+#define DECODE_MODE_FSK 1
+
+/* 0=ASK envelope；1=FSK 過零點頻率 */
+#define ACTIVE_DECODE_MODE DECODE_MODE_FSK
+
+#if ACTIVE_DECODE_MODE == DECODE_MODE_FSK
+/* 256µs（4×64µs 視窗）滑動總和門檻：12.5kHz 約 6.4 次、15.6kHz 約 8 次 */
+#define FSK_CROSS_THRESHOLD 7
+
+static int fsk_window_crosses;
+static int16_t last_fsk_sample;
+#endif
+/* ====================================================== */
+
 #define RFID_PWM_TOP 64U
 /* UP_AND_DOWN + INDIVIDUAL；對齊 EFM32 TIMER DTI（rise/fall dead time） */
 #define RFID_PWM_DTI_ENABLE 1
@@ -151,7 +167,7 @@ LOG_MODULE_REGISTER(rfid_main);
 #if RFID_LOG_MINIMAL
 #define RFID_SAADC_LOG_IMPORTANT_ONLY 1
 #define RFID_SAADC_VERBOSE_ENV_LOG 0
-#define RFID_DECODE_DIAG_LOG 0
+#define RFID_DECODE_DIAG_LOG 1
 #define RFID_VOTE_DIAG_LOG 0
 #define RFID_RX_CAPTURE_STATS_LOG 0
 #define RFID_MAIN_IDLE_LOG 0
@@ -175,10 +191,10 @@ LOG_MODULE_REGISTER(rfid_main);
 /* RF/96 確認；SAADC Manchester 也縮小到 704..832 */
 #define RFID_SAADC_MANCHESTER_HALF_MIN_Q8 896U
 #define RFID_SAADC_MANCHESTER_HALF_MAX_Q8 1152U
-/* 步長加大：448..896 範圍以 8 步掃描（共約 56 個 half 值），保持速度 */
-#define RFID_SAADC_MANCHESTER_HALF_STEP_Q8 16U
-/* bad 波動主因：phase 採樣邊界；coarse 4、refine 2（見 PHASE_REFINE） */
-#define RFID_SAADC_MANCHESTER_OFFSET_STEP_Q8 4U
+/* 步長加大：448..896 範圍粗掃，縮短全域相位搜尋時間 */
+#define RFID_SAADC_MANCHESTER_HALF_STEP_Q8 64U
+/* bad 波動主因：phase 採樣邊界；coarse 步距加大加速 FSK/ASK 解碼 */
+#define RFID_SAADC_MANCHESTER_OFFSET_STEP_Q8 64U
 /* 1=上一輪最佳 (half,phase) ±窗口，避免每輪從 0 掃描造成 bad 飄移 */
 #define RFID_SAADC_PHASE_TRACK_ENABLE 1
 #define RFID_SAADC_PHASE_TRACK_WINDOW_Q8 64U
@@ -389,6 +405,9 @@ static int16_t em_et_edge_pos[800]; /* edge window 位置 */
 static int8_t em_et_edge_dir[800];  /* +1=rising, -1=falling */
 static uint8_t em_et_bits[800];     /* 解碼後 bit 串 */
 static uint8_t env_level_samples[EM_ENV_LEVEL_CAP];
+#if ACTIVE_DECODE_MODE == DECODE_MODE_FSK
+static uint8_t fsk_cross_history[EM_ENV_LEVEL_CAP];
+#endif
 static int16_t adc_window_avg_samples[EM_ENV_LEVEL_CAP];
 static int16_t adc_window_pp_samples[EM_ENV_LEVEL_CAP];
 static int16_t adc_window_signed_samples[EM_ENV_LEVEL_CAP];
@@ -4951,6 +4970,11 @@ static void rfid_saadc_capture_reset(void) {
   saadc_dc_bias_sample_count = 0;
   saadc_dc_offset = 0;
 #endif
+#if ACTIVE_DECODE_MODE == DECODE_MODE_FSK
+  fsk_window_crosses = 0;
+  last_fsk_sample = 0;
+  memset(fsk_cross_history, 0, sizeof(fsk_cross_history));
+#endif
 }
 
 static void rfid_saadc_process_sample(int16_t sample) {
@@ -4976,6 +5000,14 @@ static void rfid_saadc_process_sample(int16_t sample) {
   sample = (int16_t)(sample >> RFID_SAADC_SAMPLE_RSHIFT);
 #endif
   uint32_t abs_sample = (sample < 0) ? (uint32_t)(-sample) : (uint32_t)sample;
+
+#if ACTIVE_DECODE_MODE == DECODE_MODE_FSK
+  if ((sample >= 0 && last_fsk_sample < 0) ||
+      (sample < 0 && last_fsk_sample >= 0)) {
+    fsk_window_crosses++;
+  }
+  last_fsk_sample = sample;
+#endif
 
   rfid_saadc_raw_samples++;
   rfid_saadc_raw_sum += sample;
@@ -5012,6 +5044,11 @@ static void rfid_saadc_process_sample(int16_t sample) {
     int count = rfid_saadc_env_level_count;
 
     if (count < EM_ENV_LEVEL_CAP) {
+#if ACTIVE_DECODE_MODE == DECODE_MODE_FSK
+      fsk_cross_history[count] =
+          (uint8_t)((fsk_window_crosses > 255) ? 255 : fsk_window_crosses);
+      fsk_window_crosses = 0;
+#endif
       int16_t pp = (int16_t)(rfid_saadc_window_max - rfid_saadc_window_min);
       int32_t signed_avg =
           rfid_saadc_window_signed_sum / (int32_t)rfid_saadc_window_samples;
@@ -5166,6 +5203,40 @@ static void rfid_saadc_dump_window_csv(int env_level_count) {
 
 static int rfid_saadc_decode_from_envelope(int env_level_count,
                                            const char* tag) {
+#if ACTIVE_DECODE_MODE == DECODE_MODE_FSK
+  if (env_level_count < 128) {
+    return 0;
+  }
+
+  /* 4-window (256µs) 滑動總和 → 0/1 偽包絡，交給 ASK Manchester 解碼器 */
+  for (int i = 0; i < env_level_count; i++) {
+    int sum_cross = 0;
+    int win_count = 0;
+
+    for (int j = i; j < i + 4 && j < env_level_count; j++) {
+      sum_cross += (int)fsk_cross_history[j];
+      win_count++;
+    }
+    if (win_count <= 0) {
+      env_level_samples[i] = 0U;
+      env_edge_samples[i] = 0U;
+      continue;
+    }
+    const int normalized_cross = (sum_cross * 4) / win_count;
+
+    env_level_samples[i] = (normalized_cross >= FSK_CROSS_THRESHOLD) ? 1U : 0U;
+    env_edge_samples[i] = env_level_samples[i] ? 255U : 0U;
+  }
+
+#if RFID_SAADC_DECODE_ENABLE
+  if (em4095_try_level_decoders(env_level_count, "fsk", 0, 0)) {
+    return 1;
+  }
+#endif
+  ARG_UNUSED(tag);
+  return 2;
+
+#else
   uint32_t adc_hist[8] = {0};
   uint32_t transitions = 0;
   uint32_t high_windows = 0;
@@ -5290,6 +5361,7 @@ static int rfid_saadc_decode_from_envelope(int env_level_count,
   }
 #endif
   return 2;
+#endif /* ACTIVE_DECODE_MODE != DECODE_MODE_FSK */
 }
 
 static int em4095_try_level_decoders(int env_level_count, const char* frac_tag,
