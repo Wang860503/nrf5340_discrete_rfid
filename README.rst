@@ -30,4 +30,15 @@ Sample Output
 
     Hello World! x86
 
+Pin Map
+=============
+
+.. code-block:: console
+
+    CLK_P → P1.09
+    CLK_N → P1.10
+
+    CMP_P → P0.04
+    CMP_N → P0.05
+
 Exit QEMU by pressing :kbd:`CTRL+A` :kbd:`x`.
