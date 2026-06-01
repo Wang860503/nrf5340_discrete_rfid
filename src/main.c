@@ -18,6 +18,7 @@
 #include <zephyr/devicetree.h>
 #include <zephyr/drivers/comparator.h>
 #include <zephyr/drivers/comparator/nrf_comp.h>
+#include <zephyr/drivers/gpio.h>
 #include <zephyr/drivers/uart.h>
 #include <zephyr/irq.h>
 #include <zephyr/kernel.h>
@@ -25,16 +26,44 @@
 
 LOG_MODULE_REGISTER(rfid_main);
 
+#define LED0_NODE DT_ALIAS(led0)
+static const struct gpio_dt_spec led = GPIO_DT_SPEC_GET(LED0_NODE, gpios);
+
 /* ==================== 解碼模式切換 ==================== */
 #define DECODE_MODE_ASK 0
 #define DECODE_MODE_FSK 1
 
-/* 0=ASK envelope；1=FSK 過零點頻率 */
-#define ACTIVE_DECODE_MODE DECODE_MODE_ASK
+/* 0=ASK(EM4100)；1=FSK(HID Prox) */
+#define ACTIVE_DECODE_MODE DECODE_MODE_FSK
+/* 1=僅 FSK：首次載波穩定 + 縮短輪詢（不改 6 視窗解調／擷取長度） */
+#define RFID_FSK_RECOGNITION_FAST 1
+#if ACTIVE_DECODE_MODE == DECODE_MODE_FSK && RFID_FSK_RECOGNITION_FAST
+#define RFID_FSK_FAST_ACTIVE 1
+#else
+#define RFID_FSK_FAST_ACTIVE 0
+#endif
+#if ACTIVE_DECODE_MODE == DECODE_MODE_FSK && RFID_FSK_FAST_ACTIVE
+/* 1=上電即用實測 half/phase，略過首輪 ~8s 全掃（換卡/天線可改下面兩值或設 0）
+ */
+#define RFID_FSK_BOOTSTRAP_PHASE_LOCK 1
+#define RFID_FSK_BOOTSTRAP_HALF_Q8 1600U
+#define RFID_FSK_BOOTSTRAP_PHASE_Q8 96U
+#else
+#define RFID_FSK_BOOTSTRAP_PHASE_LOCK 0
+#endif
 
 #if ACTIVE_DECODE_MODE == DECODE_MODE_FSK
 static int fsk_window_crosses;
 static int16_t last_fsk_sample;
+/* 量測此 CN 從本輪擷取開始到 HID 解碼成功的耗時 */
+#define RFID_TIMING_TARGET_CN 20495U
+static int64_t rfid_timing_round_start_ms;
+static int64_t rfid_timing_decode_start_ms;
+static uint32_t rfid_timing_capture_us;
+/* 上一輪 HID 已成功：保留 half/phase，下一輪勿從 640 全掃 */
+static bool rfid_saadc_hid_phase_hold;
+/* bootstrap 已預設 hold：仍要在第一次 HID 成功時印 log */
+static bool rfid_fsk_log_next_match;
 #endif
 /* ====================================================== */
 
@@ -157,7 +186,7 @@ static int16_t last_fsk_sample;
 #define RFID_SAADC_DECODE_ENABLE 1
 #define RFID_SAADC_STRICT_MANCHESTER_ONLY 1
 /* strict 下允許 frame_bad≤此值時改走 parity 容錯解碼器（量產抗噪） */
-#define RFID_SAADC_STRICT_MAX_BAD_PAIRS 8U
+#define RFID_SAADC_STRICT_MAX_BAD_PAIRS 10U
 /* 1=日常／量產：僅 [CARD_READY]、啟動摘要、錯誤、SAADC 飽和警示 */
 #define RFID_LOG_MINIMAL 1
 
@@ -187,12 +216,18 @@ static int16_t last_fsk_sample;
 #define RFID_SAADC_DC_BIAS_LEARN_SAMPLES 1000U
 /* RF/96 確認；SAADC Manchester 也縮小到 704..832 */
 /* 640≈160µs、1800≈450µs：涵蓋 EM4100(256µs) 與 HID Prox FSK(400µs) */
+#if ACTIVE_DECODE_MODE == DECODE_MODE_ASK
+#define RFID_SAADC_MANCHESTER_HALF_MIN_Q8 1200U
+#define RFID_SAADC_MANCHESTER_HALF_MAX_Q8 1600U
+#else
 #define RFID_SAADC_MANCHESTER_HALF_MIN_Q8 640U
 #define RFID_SAADC_MANCHESTER_HALF_MAX_Q8 1800U
-/* 步長：448..896 範圍粗掃 */
+#endif
+
+/* 步長 16：FSK/ASK 共用，粗掃過粗會漏 half_q8 */
 #define RFID_SAADC_MANCHESTER_HALF_STEP_Q8 16U
-/* bad 波動主因：phase 採樣邊界；coarse 步距 */
 #define RFID_SAADC_MANCHESTER_OFFSET_STEP_Q8 16U
+#define RFID_SAADC_PHASE_WIDE_STEP_Q8 16U
 /* 1=上一輪最佳 (half,phase) ±窗口，避免每輪從 0 掃描造成 bad 飄移 */
 #define RFID_SAADC_PHASE_TRACK_ENABLE 1
 #define RFID_SAADC_PHASE_TRACK_WINDOW_Q8 64U
@@ -208,11 +243,8 @@ static int16_t last_fsk_sample;
 #define RFID_SAADC_PHASE_FULL_WIDE_EVERY 4U
 /* 連續 hold 且 bad 仍高 → 解除 lock 做一輪全掃 */
 #define RFID_SAADC_PHASE_HOLD_RESCAN_GT 6U
-/* 首輪 wide 掃描步距 */
-#define RFID_SAADC_PHASE_WIDE_STEP_Q8 16U
 /* bad≤18 時加大 refine 半徑（涵蓋 392↔584 帶） */
 #define RFID_SAADC_PHASE_REFINE_WIDE_RADIUS_Q8 96U
-/* 1=coarse 後在最佳點附近細掃 phase/half */
 #define RFID_SAADC_PHASE_REFINE_ENABLE 1
 #define RFID_SAADC_PHASE_REFINE_RADIUS_Q8 48U
 #define RFID_SAADC_PHASE_REFINE_HALF_RADIUS_Q8 16U
@@ -318,9 +350,8 @@ static int16_t last_fsk_sample;
 #define EM_MIN_STORED_TO_DECODE 300
 /* 128µs 窗：有卡時 long 常見 96–120；100 會誤觸 decode_skip */
 #define EM_MIN_LONG_TICKS_TO_DECODE 80
-/* 同一 raw40 在單次 200ms 擷取窗內至少 N 次才進入 streak */
+/* 同一 raw40 在單次擷取窗內至少 N 次才進入 streak（僅 EM4100 舊路徑） */
 #define EM_CANDIDATE_CONFIRM_COUNT 5
-/* 連續 N 次 pool 確認同一 ID 才對外輸出（通用，不鎖卡號） */
 #define EM_ID_STREAK_CONFIRM_COUNT 5
 #define EM_CONFIRM_TRACKED_CODES 8
 /* 0=少印 [CANDIDATE-*] 雜訊；1=除錯 */
@@ -338,10 +369,23 @@ static int16_t last_fsk_sample;
 #define EM_ROW_VOTE_DATA_BITS 4
 #define EM_ROW_VOTE_DEPTH 7
 #define EM_WHOLE_FEED_MIN_CONSENSUS_ROWS 6
-#define RFID_CAPTURE_WINDOW_MS_FAST 100
-#define RFID_CAPTURE_WINDOW_MS_BALANCED 150
-#define RFID_CAPTURE_WINDOW_MS_STABLE 200U
+#define RFID_CAPTURE_WINDOW_MS_BALANCED 75U
+#define RFID_CAPTURE_WINDOW_MS_STABLE 100U
+#define RFID_FSK_CAPTURE_WINDOW_MS 85U /* FSK 保守加速：實測穩定可再略降 */
+#if RFID_FSK_FAST_ACTIVE
+#define RFID_CAPTURE_WINDOW_MS RFID_FSK_CAPTURE_WINDOW_MS
+#else
 #define RFID_CAPTURE_WINDOW_MS RFID_CAPTURE_WINDOW_MS_STABLE
+#endif
+#if RFID_FSK_FAST_ACTIVE
+#define RFID_SAADC_CARRIER_SETTLE_MS 50U /* FSK：僅首次擷取前等載波 */
+#define RFID_SAADC_POST_ABORT_SLEEP_MS 0U
+#define RFID_SAADC_CAPTURE_POLL_MS 1U
+#else
+#define RFID_SAADC_CARRIER_SETTLE_MS 0U
+#define RFID_SAADC_POST_ABORT_SLEEP_MS 2U
+#define RFID_SAADC_CAPTURE_POLL_MS 2U
+#endif
 /* 診斷：驗證 frame 偏移是否只差 ±2 bits。 */
 #define RFID_EM4100_SHIFT_SCAN_RADIUS 2
 #define EM_SKIP_FIRST_GAP_US 2500
@@ -466,6 +510,9 @@ static volatile uint32_t rfid_saadc_target_windows = RFID_SAADC_TARGET_WINDOWS;
 static bool rfid_saadc_ready;
 static bool rfid_saadc_irq_connected;
 static volatile bool rfid_saadc_capture_done;
+#if RFID_SAADC_CARRIER_SETTLE_MS > 0U
+static bool rfid_saadc_carrier_settled;
+#endif
 static volatile uint32_t rfid_saadc_raw_samples;
 static volatile uint32_t rfid_saadc_sample_errors;
 static volatile uint32_t rfid_saadc_clip_samples;
@@ -2525,6 +2572,46 @@ static bool saadc_pair_parity_rescue_at(uint8_t* bits, const uint8_t* pair_bad,
   return false;
 }
 
+#if ACTIVE_DECODE_MODE == DECODE_MODE_FSK
+/* printk 直出 UART，避免 LOG 緩衝導致 LED 已亮、串口延遲 */
+static void rfid_hid_match_report(uint32_t hid_fc, uint32_t hid_cn,
+                                  uint64_t hid_raw44, int inv, uint32_t half_q8,
+                                  uint32_t phase_q8) {
+  const bool first_hid_lock = !rfid_saadc_hid_phase_hold;
+  const int64_t now_ms = k_uptime_get();
+  const int64_t scan_ms = now_ms - rfid_timing_decode_start_ms;
+  const bool log_this_match =
+      first_hid_lock || rfid_fsk_log_next_match || (scan_ms >= 500);
+
+  rfid_saadc_hid_phase_hold = true;
+  rfid_saadc_phase_valid = true;
+  rfid_saadc_tracked_half_q8 = half_q8;
+  rfid_saadc_tracked_phase_q8 = phase_q8;
+  rfid_saadc_tracked_bad = 0;
+  rfid_saadc_tracked_score = 0;
+
+  /* 每次 HID 成功都印卡號；TIMING 僅首次／bootstrap／慢掃（避免刷屏） */
+  if (log_this_match && hid_cn == RFID_TIMING_TARGET_CN) {
+    printk(
+        "[TIMING-CN%u] total_ms=%lld capture_ms=%u scan_ms=%lld "
+        "half_q8=%u phase_q8=%u inv=%d%s\n",
+        (unsigned)RFID_TIMING_TARGET_CN,
+        (long long)(now_ms - rfid_timing_round_start_ms),
+        rfid_timing_capture_us / 1000U, (long long)scan_ms, (unsigned)half_q8,
+        (unsigned)phase_q8, inv,
+        first_hid_lock ? " (first_lock)"
+                       : (rfid_fsk_log_next_match ? " (bootstrap)" : ""));
+    rfid_fsk_log_next_match = false;
+  }
+  printk("!!! [HID PROX MATCH] FC: %u, CN: %u, w26_raw: %08llX (inv=%d, "
+         "half=%u)\n",
+         hid_fc, hid_cn, (unsigned long long)hid_raw44, inv,
+         (unsigned)half_q8);
+
+  gpio_pin_set_dt(&led, (hid_cn == 20495U) ? 1 : 0);
+}
+#endif
+
 /* 單一 (half_q8, phase_q8) 曼徹斯特解碼；成功回傳 frame offset，否則 -1 */
 static int saadc_pair_try_phase_config(
     int level_len, uint32_t level_limit_q8, uint32_t half_q8, uint32_t phase_q8,
@@ -2577,11 +2664,8 @@ static int saadc_pair_try_phase_config(
 
       if (decode_hid_prox(dec_raw_bits, bit_len, &hid_raw44, &hid_fc,
                           &hid_cn)) {
-        LOG_WRN(
-            "!!! [HID PROX MATCH] FC: %u, CN: %u, w26_raw: %08llX (inv=%d, "
-            "half=%u)",
-            hid_fc, hid_cn, (unsigned long long)hid_raw44, inv,
-            (unsigned)half_q8);
+        rfid_hid_match_report(hid_fc, hid_cn, hid_raw44, inv, half_q8,
+                              phase_q8);
 
         *out_code = ((uint64_t)hid_fc << 16) | (uint64_t)hid_cn;
         *out_bits = bit_len;
@@ -2747,8 +2831,7 @@ static int try_em4100_saadc_pair_decode(int level_len, uint64_t* out_code,
   uint32_t half_lo = RFID_SAADC_MANCHESTER_HALF_MIN_Q8;
   uint32_t half_hi = RFID_SAADC_MANCHESTER_HALF_MAX_Q8;
 #if ACTIVE_DECODE_MODE == DECODE_MODE_FSK
-  /* HID 真半位 ~400µs(half_q8≈1600)；FSK 每幀全範圍掃描 */
-  const bool narrow_scan = false;
+  const bool narrow_scan = rfid_saadc_hid_phase_hold && rfid_saadc_phase_valid;
 #else
   const bool narrow_scan = rfid_saadc_phase_valid;
 #endif
@@ -2756,6 +2839,20 @@ static int try_em4100_saadc_pair_decode(int level_len, uint64_t* out_code,
   const uint32_t phase_step_q8 = narrow_scan
                                      ? RFID_SAADC_MANCHESTER_OFFSET_STEP_Q8
                                      : RFID_SAADC_PHASE_WIDE_STEP_Q8;
+
+#if ACTIVE_DECODE_MODE == DECODE_MODE_FSK
+  if (rfid_saadc_hid_phase_hold && rfid_saadc_phase_valid) {
+    int hit = saadc_pair_try_phase_config(
+        level_len, level_limit_q8, rfid_saadc_tracked_half_q8,
+        rfid_saadc_tracked_phase_q8, &best_score, &best_bad, &best_half_q8,
+        &best_phase_q8, &best_off, &best_inv, &best_header, &best_row,
+        &best_col, &best_stop, &best_bits, &best_code, out_code, out_bits,
+        out_half_windows, out_offset, out_inverted, out_bad_pairs);
+    if (hit >= 0) {
+      return hit;
+    }
+  }
+#endif
 
 #if RFID_SAADC_PHASE_TRACK_ENABLE && RFID_SAADC_PHASE_LOCK_NARROW
   if (rfid_saadc_phase_valid) {
@@ -5111,6 +5208,18 @@ static void tick_buffer_append(uint32_t diff_us, uint8_t edge_to_level,
   (*demod_counter)++;
 }
 
+#if RFID_USE_SAADC_RECEIVER && RFID_FSK_BOOTSTRAP_PHASE_LOCK
+static void rfid_saadc_fsk_bootstrap_phase_lock(void) {
+  rfid_saadc_hid_phase_hold = true;
+  rfid_saadc_phase_valid = true;
+  rfid_saadc_tracked_half_q8 = RFID_FSK_BOOTSTRAP_HALF_Q8;
+  rfid_saadc_tracked_phase_q8 = RFID_FSK_BOOTSTRAP_PHASE_Q8;
+  rfid_saadc_tracked_bad = 0;
+  rfid_saadc_tracked_score = 0;
+  rfid_fsk_log_next_match = true;
+}
+#endif
+
 #if RFID_USE_SAADC_RECEIVER
 static void rfid_saadc_capture_reset(void) {
   rfid_saadc_capture_done = false;
@@ -5139,10 +5248,12 @@ static void rfid_saadc_capture_reset(void) {
   fsk_window_crosses = 0;
   last_fsk_sample = 0;
   memset(fsk_cross_history, 0, sizeof(fsk_cross_history));
-  /* 每幀重掃 640..1800，避免 phase_lock 卡在 800(200µs 諧波) */
-  rfid_saadc_phase_valid = false;
-  rfid_saadc_tracked_bad = 1000;
-  rfid_saadc_tracked_score = 1000;
+  if (!rfid_saadc_hid_phase_hold) {
+    /* 尚未讀到 HID：全掃 640..1800 */
+    rfid_saadc_phase_valid = false;
+    rfid_saadc_tracked_bad = 1000;
+    rfid_saadc_tracked_score = 1000;
+  }
 #endif
 }
 
@@ -5377,11 +5488,7 @@ static int rfid_saadc_decode_from_envelope(int env_level_count,
     return 0;
   }
 
-  /* 🎯 FSK 解調終極優化：改用 6 視窗 (384µs) 擴大頻率差異
-   * 12.5kHz (Logic 0) = 9.6 次過零 -> 實際讀到 9 或 10
-   * 15.625kHz (Logic 1) = 12 次過零 -> 實際讀到 12
-   * 門檻設為 11，完美切開，徹底消除離散抖動造成的 bad=2！
-   */
+  /* 6 視窗 (384µs) + 門檻 11：FSK 實測可穩定分出 12.5k / 15.625k */
   const int FSK_WINDOW_COUNT = 6;
   const int FSK_CROSS_THRESHOLD = 11;
 
@@ -5400,7 +5507,6 @@ static int rfid_saadc_decode_from_envelope(int env_level_count,
       continue;
     }
 
-    /* 若靠近尾端視窗不足 6 個，依照比例放大回推以維持基準 */
     const int normalized_cross = (sum_cross * FSK_WINDOW_COUNT) / win_count;
 
     env_level_samples[i] = (normalized_cross >= FSK_CROSS_THRESHOLD) ? 1U : 0U;
@@ -5713,12 +5819,12 @@ static int rfid_saadc_configure(void) {
     LOG_ERR("SAADC advanced mode failed: %d", err);
     return -EIO;
   }
-
-  err = nrfx_saadc_offset_calibrate(NULL);
-  if (err != NRFX_SUCCESS) {
-    LOG_WRN("SAADC offset calibration skipped/failed: %d", err);
-  }
-
+  /*
+    err = nrfx_saadc_offset_calibrate(NULL);
+    if (err != NRFX_SUCCESS) {
+      LOG_WRN("SAADC offset calibration skipped/failed: %d", err);
+    }
+  */
   rfid_saadc_ready = true;
   LOG_INF(
       "SAADC: differential AIN0(P0.04)-AIN1(P0.05), %luHz timer_cc=%lu "
@@ -5736,7 +5842,18 @@ int em4095_saadc_receiver(void) {
 
   if (rfid_saadc_configure() != 0) return 0;
 
+#if ACTIVE_DECODE_MODE == DECODE_MODE_FSK
+  rfid_timing_round_start_ms = k_uptime_get();
+#endif
+
+#if RFID_SAADC_CARRIER_SETTLE_MS > 0U
+  if (!rfid_saadc_carrier_settled) {
+    k_sleep(K_MSEC(RFID_SAADC_CARRIER_SETTLE_MS));
+    rfid_saadc_carrier_settled = true;
+  }
+#elif ACTIVE_DECODE_MODE == DECODE_MODE_ASK
   k_sleep(K_MSEC(50));
+#endif
   rfid_saadc_target_windows = RFID_SAADC_TARGET_WINDOWS;
   rfid_saadc_capture_reset();
 
@@ -5764,15 +5881,21 @@ int em4095_saadc_receiver(void) {
 
   uint64_t timeout = k_uptime_get() + RFID_CAPTURE_WINDOW_MS + 100U;
   while (!rfid_saadc_capture_done && k_uptime_get() < timeout) {
-    k_sleep(K_MSEC(2));
+    k_sleep(K_MSEC(RFID_SAADC_CAPTURE_POLL_MS));
   }
 
   nrfx_saadc_abort();
-  k_sleep(K_MSEC(2));
+#if RFID_SAADC_POST_ABORT_SLEEP_MS > 0U
+  k_sleep(K_MSEC(RFID_SAADC_POST_ABORT_SLEEP_MS));
+#endif
   env_level_count = rfid_saadc_env_level_count;
 
   uint32_t capture_us =
       k_cyc_to_us_near32(k_cycle_get_32() - capture_start_cycle);
+#if ACTIVE_DECODE_MODE == DECODE_MODE_FSK
+  rfid_timing_capture_us = capture_us;
+  rfid_timing_decode_start_ms = k_uptime_get();
+#endif
   const int32_t raw_avg =
       rfid_saadc_raw_samples
           ? (rfid_saadc_raw_sum / (int32_t)rfid_saadc_raw_samples)
@@ -6683,6 +6806,9 @@ int main(void) {
 #endif
 
   LOG_INF("nRF5340 Discrete RFID Starting...");
+  if (!gpio_is_ready_dt(&led)) return -1;
+  gpio_pin_configure_dt(&led, GPIO_OUTPUT_ACTIVE);
+  gpio_pin_set_dt(&led, 0);
 #if RFID_BOOT_SELFTEST_LOG
   em4100_decode_self_test();
 #endif
@@ -6742,6 +6868,12 @@ int main(void) {
           boot_sample);
     }
 #endif
+#if RFID_USE_SAADC_RECEIVER && RFID_FSK_BOOTSTRAP_PHASE_LOCK
+    rfid_saadc_fsk_bootstrap_phase_lock();
+    LOG_INF("FSK phase bootstrap: half_q8=%u phase_q8=%u",
+            (unsigned)RFID_FSK_BOOTSTRAP_HALF_Q8,
+            (unsigned)RFID_FSK_BOOTSTRAP_PHASE_Q8);
+#endif
   }
 
   while (!carrier_ret) {
@@ -6773,8 +6905,6 @@ int main(void) {
       LOG_INF("No card detected.");
 #endif
     }
-
-    k_sleep(K_MSEC(500));
   }
   return 0;
 }
