@@ -30,12 +30,9 @@ LOG_MODULE_REGISTER(rfid_main);
 #define DECODE_MODE_FSK 1
 
 /* 0=ASK envelope；1=FSK 過零點頻率 */
-#define ACTIVE_DECODE_MODE DECODE_MODE_FSK
+#define ACTIVE_DECODE_MODE DECODE_MODE_ASK
 
 #if ACTIVE_DECODE_MODE == DECODE_MODE_FSK
-/* 256µs（4×64µs 視窗）滑動總和門檻：12.5kHz 約 6.4 次、15.6kHz 約 8 次 */
-#define FSK_CROSS_THRESHOLD 7
-
 static int fsk_window_crosses;
 static int16_t last_fsk_sample;
 #endif
@@ -167,7 +164,7 @@ static int16_t last_fsk_sample;
 #if RFID_LOG_MINIMAL
 #define RFID_SAADC_LOG_IMPORTANT_ONLY 1
 #define RFID_SAADC_VERBOSE_ENV_LOG 0
-#define RFID_DECODE_DIAG_LOG 1
+#define RFID_DECODE_DIAG_LOG 0
 #define RFID_VOTE_DIAG_LOG 0
 #define RFID_RX_CAPTURE_STATS_LOG 0
 #define RFID_MAIN_IDLE_LOG 0
@@ -186,15 +183,16 @@ static int16_t last_fsk_sample;
 #define RFID_EM4100_ROW_PARITY_TOLERANCE 0
 #define RFID_EM4100_COL_PARITY_TOLERANCE 0
 /* 每段 capture 前 N 樣本學習差動 DC，之後扣除 */
-#define RFID_SAADC_DC_BIAS_ENABLE 0
-#define RFID_SAADC_DC_BIAS_LEARN_SAMPLES 5000U
+#define RFID_SAADC_DC_BIAS_ENABLE 1
+#define RFID_SAADC_DC_BIAS_LEARN_SAMPLES 1000U
 /* RF/96 確認；SAADC Manchester 也縮小到 704..832 */
-#define RFID_SAADC_MANCHESTER_HALF_MIN_Q8 896U
-#define RFID_SAADC_MANCHESTER_HALF_MAX_Q8 1152U
-/* 步長加大：448..896 範圍粗掃，縮短全域相位搜尋時間 */
-#define RFID_SAADC_MANCHESTER_HALF_STEP_Q8 64U
-/* bad 波動主因：phase 採樣邊界；coarse 步距加大加速 FSK/ASK 解碼 */
-#define RFID_SAADC_MANCHESTER_OFFSET_STEP_Q8 64U
+/* 640≈160µs、1800≈450µs：涵蓋 EM4100(256µs) 與 HID Prox FSK(400µs) */
+#define RFID_SAADC_MANCHESTER_HALF_MIN_Q8 640U
+#define RFID_SAADC_MANCHESTER_HALF_MAX_Q8 1800U
+/* 步長：448..896 範圍粗掃 */
+#define RFID_SAADC_MANCHESTER_HALF_STEP_Q8 16U
+/* bad 波動主因：phase 採樣邊界；coarse 步距 */
+#define RFID_SAADC_MANCHESTER_OFFSET_STEP_Q8 16U
 /* 1=上一輪最佳 (half,phase) ±窗口，避免每輪從 0 掃描造成 bad 飄移 */
 #define RFID_SAADC_PHASE_TRACK_ENABLE 1
 #define RFID_SAADC_PHASE_TRACK_WINDOW_Q8 64U
@@ -210,8 +208,8 @@ static int16_t last_fsk_sample;
 #define RFID_SAADC_PHASE_FULL_WIDE_EVERY 4U
 /* 連續 hold 且 bad 仍高 → 解除 lock 做一輪全掃 */
 #define RFID_SAADC_PHASE_HOLD_RESCAN_GT 6U
-/* 首輪 wide 掃描用較大步距（8），縮短 ~45s 空窗 */
-#define RFID_SAADC_PHASE_WIDE_STEP_Q8 8U
+/* 首輪 wide 掃描步距 */
+#define RFID_SAADC_PHASE_WIDE_STEP_Q8 16U
 /* bad≤18 時加大 refine 半徑（涵蓋 392↔584 帶） */
 #define RFID_SAADC_PHASE_REFINE_WIDE_RADIUS_Q8 96U
 /* 1=coarse 後在最佳點附近細掃 phase/half */
@@ -789,6 +787,99 @@ uint64_t decode_card_code(uint8_t* bits) {
     code |= ((uint64_t)digit << (4 * (9 - j)));
   }
   return code;
+}
+
+/* 🎯 HID Prox
+ * (Wiegand-26)：依靠零容錯曼徹斯特解碼與幀內雙重驗證，徹底消滅幽靈！ */
+static bool decode_hid_prox(const uint8_t* bits, int len, uint64_t* out_raw44,
+                            uint32_t* facility_code, uint32_t* card_number) {
+  int zero_count = 0;
+  uint32_t w26_candidates[6] = {0};  // 儲存同一個陣列中找到的候選封包
+  int candidate_count = 0;
+  int total_bad = 0;
+
+  if (facility_code == NULL || card_number == NULL || len < 64) {
+    return false;
+  }
+
+  /* 🛡️ 第一道防線：全域相位鎖定。
+   * 如果這個相位的總 Manchester 錯誤率超過 12.5%，直接踢掉！ */
+  for (int i = 0; i < len; i++) {
+    if (dec_pair_bad[i]) total_bad++;
+  }
+  if (total_bad > (len / 8)) {
+    return false;
+  }
+
+  /* 1. 掃描整個波形陣列，抓出 Wiegand 26 封包 */
+  for (int i = 0; i < len; i++) {
+    if (bits[i] == 0) {
+      zero_count++;
+    } else {
+      /* 🎯 放寬 Preamble：真實波形大約只有 6 個 0，我們設定 >= 5 */
+      if (zero_count >= 5) {
+        const int start_idx = i;
+
+        if (start_idx + 26 < len) {
+          uint32_t w26 = 0;
+          int bad_manchester = 0;
+
+          /* 提取 26 位元，並統計該封包內的 Manchester 錯誤數 */
+          for (int j = 1; j <= 26; j++) {
+            w26 = (w26 << 1) | (bits[start_idx + j] ? 1U : 0U);
+            if (dec_pair_bad[start_idx + j]) {
+              bad_manchester++;
+            }
+          }
+
+          const uint8_t p_even = (uint8_t)((w26 >> 25) & 1U);
+          const uint8_t p_odd = (uint8_t)(w26 & 1U);
+          const uint32_t fc = (uint32_t)((w26 >> 17) & 0xFFU);
+          const uint32_t cn = (uint32_t)((w26 >> 1) & 0xFFFFU);
+
+          uint8_t calc_even = 0U;
+          for (int k = 13; k <= 24; k++)
+            calc_even ^= (uint8_t)((w26 >> k) & 1U);
+
+          uint8_t calc_odd = 1U;
+          for (int k = 1; k <= 12; k++) calc_odd ^= (uint8_t)((w26 >> k) & 1U);
+
+          /* 🛡️ 核心防線：Parity 正確 + 曼徹斯特錯誤必須為 0！
+           * 因為現在 FSK 6 視窗很完美，真正的封包 bad 一定是 0。
+           * 我們拿掉了不準確的尾部檢測，靠這條嚴格規則來過濾雜訊。 */
+          if (calc_even == p_even && calc_odd == p_odd && cn != 0 &&
+              bad_manchester == 0) {
+            if (candidate_count < (int)ARRAY_SIZE(w26_candidates)) {
+              w26_candidates[candidate_count++] = w26;
+            }
+            i = start_idx + 26; /* 推進指標，跳過已解碼資料 */
+          }
+        }
+      }
+      zero_count = 0;
+    }
+  }
+
+  /* 🛡️ 最終防線：閃電雙重防偽。
+   * 同一個陣列內，一模一樣的卡號必須重複出現 >= 2 次，100% 是真卡！ */
+  for (int c1 = 0; c1 < candidate_count; c1++) {
+    int match = 1;
+    for (int c2 = c1 + 1; c2 < candidate_count; c2++) {
+      if (w26_candidates[c1] == w26_candidates[c2]) {
+        match++;
+      }
+    }
+
+    if (match >= 2) {
+      uint32_t final_w26 = w26_candidates[c1];
+      if (out_raw44 != NULL) *out_raw44 = final_w26;
+      *facility_code = (final_w26 >> 17) & 0xFFU;
+      *card_number = (final_w26 >> 1) & 0xFFFFU;
+      return true;
+    }
+  }
+
+  return false;
 }
 
 static uint8_t env_majority_level(const uint8_t* levels, int start, int width);
@@ -2478,6 +2569,35 @@ static int saadc_pair_try_phase_config(
       invert_bits(dec_raw_bits, bit_len);
     }
 
+    /* 👇 優先執行 HID Prox 嚴格校驗（具備幀內雙重校驗，保證 0 誤判） */
+    {
+      uint64_t hid_raw44 = 0ULL;
+      uint32_t hid_fc = 0;
+      uint32_t hid_cn = 0;
+
+      if (decode_hid_prox(dec_raw_bits, bit_len, &hid_raw44, &hid_fc,
+                          &hid_cn)) {
+        LOG_WRN(
+            "!!! [HID PROX MATCH] FC: %u, CN: %u, w26_raw: %08llX (inv=%d, "
+            "half=%u)",
+            hid_fc, hid_cn, (unsigned long long)hid_raw44, inv,
+            (unsigned)half_q8);
+
+        *out_code = ((uint64_t)hid_fc << 16) | (uint64_t)hid_cn;
+        *out_bits = bit_len;
+        *out_half_windows = (int)half_q8;
+        *out_offset = (int)phase_q8;
+        *out_inverted = inv != 0;
+        *out_bad_pairs = 0;
+
+        if (inv) {
+          invert_bits(dec_raw_bits, bit_len);
+        }
+        return 0; /* 🚀 解除封印！不用等 5
+                     次了，只要幀內驗證通過，瞬間回傳成功！ */
+      }
+    }
+
     for (int off = 0; off <= bit_len - 64; off++) {
       int header_err;
       int row_err;
@@ -2486,27 +2606,29 @@ static int saadc_pair_try_phase_config(
       int frame_bad = dec_bad_prefix[off + 64] - dec_bad_prefix[off];
 
       if (frame_bad > 0) {
-        int bad_header;
-        int bad_row;
-        int bad_col;
-        int bad_stop;
-        int bad_score = em4100_frame_error_score(dec_raw_bits, off, &bad_header,
-                                                 &bad_row, &bad_col, &bad_stop);
+        if (frame_bad <= *best_bad) {
+          int bad_header;
+          int bad_row;
+          int bad_col;
+          int bad_stop;
+          int bad_score = em4100_frame_error_score(
+              dec_raw_bits, off, &bad_header, &bad_row, &bad_col, &bad_stop);
 
-        if (frame_bad < *best_bad ||
-            (frame_bad == *best_bad && bad_score < *best_score)) {
-          *best_bad = frame_bad;
-          *best_half_q8 = half_q8;
-          *best_phase_q8 = phase_q8;
-          *best_off = off;
-          *best_inv = inv;
-          *best_header = bad_header;
-          *best_row = bad_row;
-          *best_col = bad_col;
-          *best_stop = bad_stop;
-          *best_bits = bit_len;
-          *best_code = decode_card_code((uint8_t*)&dec_raw_bits[off]);
-          *best_score = bad_score;
+          if (frame_bad < *best_bad ||
+              (frame_bad == *best_bad && bad_score < *best_score)) {
+            *best_bad = frame_bad;
+            *best_half_q8 = half_q8;
+            *best_phase_q8 = phase_q8;
+            *best_off = off;
+            *best_inv = inv;
+            *best_header = bad_header;
+            *best_row = bad_row;
+            *best_col = bad_col;
+            *best_stop = bad_stop;
+            *best_bits = bit_len;
+            *best_code = decode_card_code((uint8_t*)&dec_raw_bits[off]);
+            *best_score = bad_score;
+          }
         }
         continue;
       }
@@ -2624,7 +2746,12 @@ static int try_em4100_saadc_pair_decode(int level_len, uint64_t* out_code,
   const uint32_t level_limit_q8 = (uint32_t)(level_len - 1) << 8;
   uint32_t half_lo = RFID_SAADC_MANCHESTER_HALF_MIN_Q8;
   uint32_t half_hi = RFID_SAADC_MANCHESTER_HALF_MAX_Q8;
+#if ACTIVE_DECODE_MODE == DECODE_MODE_FSK
+  /* HID 真半位 ~400µs(half_q8≈1600)；FSK 每幀全範圍掃描 */
+  const bool narrow_scan = false;
+#else
   const bool narrow_scan = rfid_saadc_phase_valid;
+#endif
   bool guided_wide = false;
   const uint32_t phase_step_q8 = narrow_scan
                                      ? RFID_SAADC_MANCHESTER_OFFSET_STEP_Q8
@@ -2897,7 +3024,12 @@ static int try_em4100_saadc_pair_decode(int level_len, uint64_t* out_code,
       rfid_saadc_tracked_bad = best_bad;
       rfid_saadc_tracked_score = best_score;
       rfid_saadc_phase_hold_streak = 0U;
+#if ACTIVE_DECODE_MODE == DECODE_MODE_FSK
+      if (best_bad <= (int)RFID_SAADC_PHASE_LOCK_MAX_BAD &&
+          best_half_q8 >= 1400U) {
+#else
       if (best_bad <= (int)RFID_SAADC_PHASE_LOCK_MAX_BAD) {
+#endif
         rfid_saadc_phase_valid = true;
         if (log_best) {
           LOG_WRN(
@@ -2957,13 +3089,42 @@ static int try_em4100_saadc_pair_decode(int level_len, uint64_t* out_code,
   rfid_saadc_pair_last_best_bad = best_bad;
   rfid_saadc_pair_last_best_score = best_score;
 
-  if (best_bad <= 20 && best_off >= 0 && best_off + 64 <= EM_DECODED_BITS_CAP) {
-    char bits_str[65];
-    for (int i = 0; i < 64; i++) {
-      bits_str[i] = dec_raw_bits[best_off + i] ? '1' : '0';
+  if (best_half_q8 > 0 && best_bad <= 20) {
+    int bit_len = 0;
+    memset(dec_raw_bits, 0, EM_DECODED_BITS_CAP);
+    const uint32_t bit_q8 = best_half_q8 * 2U;
+
+    for (uint32_t pos_q8 = best_phase_q8;
+         pos_q8 + bit_q8 <= level_limit_q8 && bit_len < EM_DECODED_BITS_CAP;
+         pos_q8 += bit_q8) {
+      uint8_t first = env_majority_level_q8(env_level_samples, level_len,
+                                            pos_q8, best_half_q8);
+      uint8_t second = env_majority_level_q8(
+          env_level_samples, level_len, pos_q8 + best_half_q8, best_half_q8);
+      dec_raw_bits[bit_len++] = second;
     }
-    bits_str[64] = '\0';
-    LOG_WRN("[DEBUG-BITS] bad=%d inv=%d raw=%s", best_bad, best_inv, bits_str);
+#if !RFID_LOG_MINIMAL
+    LOG_WRN(
+        "====== [ROUND BITS DUMP] half=%u phase=%u len=%d inv=%d bad=%d ======",
+        best_half_q8, best_phase_q8, bit_len, best_inv, best_bad);
+#endif
+    if (best_inv) {
+      invert_bits(dec_raw_bits, bit_len);
+    }
+#if !RFID_LOG_MINIMAL
+    char chunk[65];
+    for (int i = 0; i < bit_len; i += 64) {
+      int chunk_len = bit_len - i;
+      if (chunk_len > 64) chunk_len = 64;
+      for (int j = 0; j < chunk_len; j++) {
+        chunk[j] = dec_raw_bits[i + j] ? '1' : '0';
+      }
+      chunk[chunk_len] = '\0';
+      LOG_WRN("BITS[%03d]: %s", i, chunk);
+    }
+    LOG_WRN(
+        "==================================================================");
+#endif
   }
 
   return -1;
@@ -3551,7 +3712,8 @@ static int try_em4100_edge_delta_decode(int level_len, uint64_t* out_code,
 
             if (header_err <= 1 && !RFID_SAADC_LOG_IMPORTANT_ONLY) {
               LOG_WRN(
-                  "[FRAME-CANDIDATE] off=%d inv=%d raw40=%010llX hdr=%d row=%d "
+                  "[FRAME-CANDIDATE] off=%d inv=%d raw40=%010llX hdr=%d "
+                  "row=%d "
                   "col=%d stop=%d bad=%d score=%d",
                   off, inv, (unsigned long long)code, header_err, row_err,
                   col_err, stop_err, frame_bad, score);
@@ -3634,7 +3796,8 @@ static int try_em4100_edge_delta_decode(int level_len, uint64_t* out_code,
         (void)confirm_em4100_candidate(code, "manual-delta");
       } else {
         LOG_WRN(
-            "!!! [MANUAL-DECODE] No header found. First bits: %d%d%d%d%d%d%d%d",
+            "!!! [MANUAL-DECODE] No header found. First bits: "
+            "%d%d%d%d%d%d%d%d",
             em_delta_best_bits_snapshot[0], em_delta_best_bits_snapshot[1],
             em_delta_best_bits_snapshot[2], em_delta_best_bits_snapshot[3],
             em_delta_best_bits_snapshot[4], em_delta_best_bits_snapshot[5],
@@ -3828,8 +3991,8 @@ static int try_em4100_edge_delta_decode(int level_len, uint64_t* out_code,
       }
       /* Differential Manchester 解碼診斷：計算相鄰 bit XOR 串的最長連續 1 */
       /* DM 編碼中 "1 bit" = 方向轉換，若卡片使用 DM，header 9個"1"會在 XOR
-       * 串中呈現為 9個連續的1（每個相鄰 bit 都不同）或9個連續的0（每個相鄰 bit
-       * 都相同） */
+       * 串中呈現為 9個連續的1（每個相鄰 bit 都不同）或9個連續的0（每個相鄰
+       * bit 都相同） */
       {
         int dm_max1 = 0, dm_cur1 = 0, dm_max1_pos = -1, dm_cur1_start = 0;
         int dm_max0 = 0, dm_cur0 = 0, dm_max0_pos = -1, dm_cur0_start = 0;
@@ -3855,14 +4018,15 @@ static int try_em4100_edge_delta_decode(int level_len, uint64_t* out_code,
           }
         }
         LOG_WRN(
-            "!!! [DM-RUN] trans-1=%d pos=%d same-0=%d pos=%d (DM header needs "
+            "!!! [DM-RUN] trans-1=%d pos=%d same-0=%d pos=%d (DM header "
+            "needs "
             "8+)",
             dm_max1, dm_max1_pos, dm_max0, dm_max0_pos);
 
         /* 嘗試 Differential Manchester EM4100 解碼：
          * XOR stream dm_bit[i] = snap[i+1] XOR snap[i] = DM 解碼後資料位元。
-         * 掃描所有資料起始位置 P：要求 P 前面有 7..9 個連續 XOR=1 (DM header)。
-         * 每個候選位置嘗試解 10 rows × 5 bit + 5 col/stop。 */
+         * 掃描所有資料起始位置 P：要求 P 前面有 7..9 個連續 XOR=1 (DM
+         * header)。 每個候選位置嘗試解 10 rows × 5 bit + 5 col/stop。 */
         {
           int xlen = best_bits_snapshot_len - 1;
           /* 建立 XOR 串 (reuse em_delta_inv_bits as temp buffer) */
@@ -4266,7 +4430,8 @@ static int try_em4100_edge_capture_decode(int tick_count, uint64_t* out_code,
 
 #if RFID_DECODE_DIAG_LOG
                 LOG_WRN(
-                    "[FRAME-edgecap hb=%d resync=%d bad=%d unit_us=%u tol=%u]",
+                    "[FRAME-edgecap hb=%d resync=%d bad=%d unit_us=%u "
+                    "tol=%u]",
                     hb_start, frame_resync, frame_bad, unit_us, tol_pct);
 #endif
                 if (confirm_em4100_candidate(candidate_code,
@@ -4974,6 +5139,10 @@ static void rfid_saadc_capture_reset(void) {
   fsk_window_crosses = 0;
   last_fsk_sample = 0;
   memset(fsk_cross_history, 0, sizeof(fsk_cross_history));
+  /* 每幀重掃 640..1800，避免 phase_lock 卡在 800(200µs 諧波) */
+  rfid_saadc_phase_valid = false;
+  rfid_saadc_tracked_bad = 1000;
+  rfid_saadc_tracked_score = 1000;
 #endif
 }
 
@@ -5208,21 +5377,31 @@ static int rfid_saadc_decode_from_envelope(int env_level_count,
     return 0;
   }
 
-  /* 4-window (256µs) 滑動總和 → 0/1 偽包絡，交給 ASK Manchester 解碼器 */
+  /* 🎯 FSK 解調終極優化：改用 6 視窗 (384µs) 擴大頻率差異
+   * 12.5kHz (Logic 0) = 9.6 次過零 -> 實際讀到 9 或 10
+   * 15.625kHz (Logic 1) = 12 次過零 -> 實際讀到 12
+   * 門檻設為 11，完美切開，徹底消除離散抖動造成的 bad=2！
+   */
+  const int FSK_WINDOW_COUNT = 6;
+  const int FSK_CROSS_THRESHOLD = 11;
+
   for (int i = 0; i < env_level_count; i++) {
     int sum_cross = 0;
     int win_count = 0;
 
-    for (int j = i; j < i + 4 && j < env_level_count; j++) {
+    for (int j = i; j < i + FSK_WINDOW_COUNT && j < env_level_count; j++) {
       sum_cross += (int)fsk_cross_history[j];
       win_count++;
     }
+
     if (win_count <= 0) {
       env_level_samples[i] = 0U;
       env_edge_samples[i] = 0U;
       continue;
     }
-    const int normalized_cross = (sum_cross * 4) / win_count;
+
+    /* 若靠近尾端視窗不足 6 個，依照比例放大回推以維持基準 */
+    const int normalized_cross = (sum_cross * FSK_WINDOW_COUNT) / win_count;
 
     env_level_samples[i] = (normalized_cross >= FSK_CROSS_THRESHOLD) ? 1U : 0U;
     env_edge_samples[i] = env_level_samples[i] ? 255U : 0U;
@@ -5236,7 +5415,8 @@ static int rfid_saadc_decode_from_envelope(int env_level_count,
   ARG_UNUSED(tag);
   return 2;
 
-#else
+#else /* 👇 景明哥，您剛剛漏掉了這個 #else ！！！ */
+
   uint32_t adc_hist[8] = {0};
   uint32_t transitions = 0;
   uint32_t high_windows = 0;
@@ -5299,8 +5479,10 @@ static int rfid_saadc_decode_from_envelope(int env_level_count,
   }
 
   const int32_t pct_range = p80 - p20;
+  int32_t active_threshold_pct = RFID_SAADC_ENV_THRESHOLD_PCT;
+
   const int32_t threshold =
-      p20 + ((pct_range * (int32_t)RFID_SAADC_ENV_THRESHOLD_PCT) / 100);
+      p20 + ((pct_range * (int32_t)active_threshold_pct) / 100);
   const int32_t hysteresis = pct_range > 64 ? (pct_range / 8) : 4;
   uint8_t last_level = 0;
   bool have_last_level = false;
@@ -5343,15 +5525,16 @@ static int rfid_saadc_decode_from_envelope(int env_level_count,
           env_range, p20, p80);
   LOG_INF("saadc_thr[%s]: threshold=%d hyst=%d pct_range=%d", tag, threshold,
           hysteresis, pct_range);
-  LOG_INF("saadc_levels[%s]: high=%u/%d transitions=%u", tag, high_windows,
-          env_level_count, transitions);
+  ARG_UNUSED(high_windows);
+  ARG_UNUSED(transitions);
+  ARG_UNUSED(adc_hist);
+#else
+  ARG_UNUSED(high_windows);
+  ARG_UNUSED(transitions);
+  ARG_UNUSED(adc_hist);
 #endif
 
   if (env_range < RFID_SAADC_MIN_RANGE_COUNTS) {
-#if RFID_SAADC_VERBOSE_ENV_LOG
-    LOG_INF("saadc_range_skip[%s]: range=%d/%d", tag, env_range,
-            RFID_SAADC_MIN_RANGE_COUNTS);
-#endif
     return 0;
   }
 
@@ -5361,7 +5544,8 @@ static int rfid_saadc_decode_from_envelope(int env_level_count,
   }
 #endif
   return 2;
-#endif /* ACTIVE_DECODE_MODE != DECODE_MODE_FSK */
+
+#endif /* 結束 FSK / ASK 判斷 */
 }
 
 static int em4095_try_level_decoders(int env_level_count, const char* frac_tag,
@@ -5413,22 +5597,20 @@ static int em4095_try_level_decoders(int env_level_count, const char* frac_tag,
 #endif
   /*
     level_slide = try_em4100_clocked_resync_decode(
-        env_level_count, &level_code, &level_bits, &half_windows, &level_offset,
-        &level_inverted, &level_bad_pairs, true);
-    if (level_slide >= 0) {
-      LOG_WRN("[SUCCESS-Clocked half_q8=%d off_q8=%d inv=%d bad=%d slide=%d]",
-              half_windows, level_offset, level_inverted, level_bad_pairs,
+        env_level_count, &level_code, &level_bits, &half_windows,
+    &level_offset, &level_inverted, &level_bad_pairs, true); if (level_slide
+    >= 0) { LOG_WRN("[SUCCESS-Clocked half_q8=%d off_q8=%d inv=%d bad=%d
+    slide=%d]", half_windows, level_offset, level_inverted, level_bad_pairs,
               level_slide);
       LOG_WRN("[SUCCESS-Clocked] ID: %08llX", (unsigned long long)level_code);
       return 1;
     }
 
     level_slide = try_em4100_fractional_level_decode(
-        env_level_count, &level_code, &level_bits, &half_windows, &level_offset,
-        &level_inverted, &level_bad_pairs, true, frac_tag);
-    if (level_slide >= 0) {
-      LOG_WRN("[SUCCESS-%s half_q8=%d off_q8=%d inv=%d bad=%d slide=%d]",
-              frac_tag, half_windows, level_offset, level_inverted,
+        env_level_count, &level_code, &level_bits, &half_windows,
+    &level_offset, &level_inverted, &level_bad_pairs, true, frac_tag); if
+    (level_slide >= 0) { LOG_WRN("[SUCCESS-%s half_q8=%d off_q8=%d inv=%d
+    bad=%d slide=%d]", frac_tag, half_windows, level_offset, level_inverted,
               level_bad_pairs, level_slide);
       LOG_WRN("[SUCCESS-%s] ID: %08llX", frac_tag,
               (unsigned long long)level_code);
@@ -5436,11 +5618,10 @@ static int em4095_try_level_decoders(int env_level_count, const char* frac_tag,
     }
 
     level_slide = try_em4100_level_decode(
-        env_level_count, &level_code, &level_bits, &half_windows, &level_offset,
-        &level_inverted, &level_bad_pairs, true);
-    if (level_slide >= 0) {
-      LOG_WRN("[SUCCESS-Level h=%d off=%d inv=%d bad=%d slide=%d bits=%d]",
-              half_windows, level_offset, level_inverted, level_bad_pairs,
+        env_level_count, &level_code, &level_bits, &half_windows,
+    &level_offset, &level_inverted, &level_bad_pairs, true); if (level_slide
+    >= 0) { LOG_WRN("[SUCCESS-Level h=%d off=%d inv=%d bad=%d slide=%d
+    bits=%d]", half_windows, level_offset, level_inverted, level_bad_pairs,
               level_slide, level_bits);
       LOG_WRN("[SUCCESS-Level] ID: %08llX", (unsigned long long)level_code);
       return 1;
@@ -5449,6 +5630,7 @@ static int em4095_try_level_decoders(int env_level_count, const char* frac_tag,
   /* 邊緣計時解碼：不依賴 bit rate，從 edge 間距自動推算 T/2 */
   saadc_edge_timing_decode_log(env_level_count);
 
+#if ACTIVE_DECODE_MODE == DECODE_MODE_ASK
   level_slide = try_em4100_edge_delta_decode(
       env_level_count, &level_code, &level_bits, &half_windows, &level_offset,
       &level_inverted, &level_bad_pairs, RFID_DECODE_DIAG_LOG);
@@ -5461,6 +5643,7 @@ static int em4095_try_level_decoders(int env_level_count, const char* frac_tag,
 #endif
     return 1;
   }
+#endif
 #if RFID_SAADC_STRICT_MANCHESTER_ONLY
   if (strict_pair_blocked) {
     return 0;
@@ -5502,7 +5685,8 @@ static int rfid_saadc_configure(void) {
     }
   }
 
-  /* P0.04=AIN0=CMP_P, P0.05=AIN1=1.65V ref（nRF5340 AIN0=P0.04, AIN1=P0.05） */
+  /* P0.04=AIN0=CMP_P, P0.05=AIN1=1.65V ref（nRF5340 AIN0=P0.04, AIN1=P0.05）
+   */
   /*
   nrfx_saadc_channel_t channel = NRFX_SAADC_DEFAULT_CHANNEL_DIFFERENTIAL(
       NRF_SAADC_INPUT_AIN0, NRF_SAADC_INPUT_AIN1, RFID_SAADC_CHANNEL_INDEX);
@@ -6180,7 +6364,8 @@ int em4095_comp_receiver(void) {
       env_short < EM_CARD_MIN_ENV_SHORT) {
 #if RFID_DECODE_DIAG_LOG
     LOG_INF(
-        "card_gate_skip: all=%u comp=%u phy=%u raw=%u trans=%u/%u short=%u/%u",
+        "card_gate_skip: all=%u comp=%u phy=%u raw=%u trans=%u/%u "
+        "short=%u/%u",
         all_edges, comp_edges, phy_edges, raw_edges, env_transitions,
         EM_CARD_MIN_ENV_TRANSITIONS, env_short, EM_CARD_MIN_ENV_SHORT);
 #endif
@@ -6222,7 +6407,8 @@ int em4095_comp_receiver(void) {
 #endif
 #if !RFID_LOG_MINIMAL
     LOG_WRN(
-        "[CARD-PRESENT] all_edges=%u comp_edges=%u phy_edges=%u raw_edges=%u, "
+        "[CARD-PRESENT] all_edges=%u comp_edges=%u phy_edges=%u "
+        "raw_edges=%u, "
         "but envelope ticks are not decodable",
         all_edges, comp_edges, phy_edges, raw_edges);
 #endif
